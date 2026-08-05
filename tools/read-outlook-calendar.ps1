@@ -20,7 +20,13 @@ try {
     $events = @()
 
     foreach ($item in $items.Restrict($restriction)) {
-        if ($item.Class -ne 26 -or $item.MeetingStatus -eq 5) { continue }
+        # Only meetings accepted by the current user (3) or organized by them
+        # (1). Status 5 is cancelled and 7 is received-and-cancelled.
+        if (
+            $item.Class -ne 26 -or
+            $item.MeetingStatus -in @(5, 7) -or
+            $item.ResponseStatus -notin @(1, 3)
+        ) { continue }
         $joinUrl = $null
         $text = [string]$item.Body
         if ($text -match 'https://teams\.microsoft\.com/l/meetup-join/[^\s<>"'']+') { $joinUrl = $Matches[0] }

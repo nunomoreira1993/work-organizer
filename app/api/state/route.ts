@@ -14,7 +14,10 @@ async function ownerEmail() {
 
 function databaseError(error: unknown) {
   const message = error instanceof Error ? error.message : "Erro inesperado.";
-  if (message.includes("no such table") || message.includes("organizer_snapshots")) {
+  if (
+    message.includes("no such table") &&
+    message.includes("organizer_snapshots")
+  ) {
     return "A base de dados ainda não foi inicializada.";
   }
   return message;

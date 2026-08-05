@@ -12,5 +12,12 @@ export async function getDb() {
     );
   }
 
+  // This application currently owns a single small table. Creating it lazily
+  // keeps a fresh local D1 database (and a first deployment) usable even when
+  // the migration command has not been run yet.
+  await env.DB.exec(
+    "CREATE TABLE IF NOT EXISTS organizer_snapshots (owner_email text PRIMARY KEY NOT NULL, state_json text NOT NULL, created_at text DEFAULT CURRENT_TIMESTAMP NOT NULL, updated_at text DEFAULT CURRENT_TIMESTAMP NOT NULL);",
+  );
+
   return drizzle(env.DB, { schema });
 }

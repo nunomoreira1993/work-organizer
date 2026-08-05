@@ -1,7 +1,13 @@
 "use client";
 
 import { PublicClientApplication } from "@azure/msal-browser";
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type DragEvent,
+} from "react";
 
 type View = "today" | "timeline" | "completed" | "analytics" | "settings";
 type Zoom = "day" | "week" | "month";
@@ -94,6 +100,7 @@ type CreateIssueDraft = {
   start: number;
   distribution: "manual" | "automatic";
   labels: string[];
+  meetingId?: string;
 };
 
 type WorkLog = {
@@ -133,6 +140,9 @@ type CalendarMeeting = {
   webUrl?: string;
   joinUrl?: string;
   projectId?: number;
+  linkedIssueId?: string;
+  linkedIssueIid?: number;
+  linkedIssueWebUrl?: string;
 };
 
 type PersistedState = {
@@ -215,6 +225,11 @@ const DEFAULT_CAPACITY: CapacityConfig = {
   startHour: 9,
   workDays: DEFAULT_WORK_DAYS,
 };
+const DEFAULT_GITLAB_CONFIG: Config = {
+  baseUrl: "https://gitlab.ddsdev.deloitte.pt",
+  token: "",
+};
+const DEFAULT_OUTLOOK_CONFIG: OutlookConfig = { tenantId: "", clientId: "" };
 const priorityOrder = { Alta: 0, Média: 1, Normal: 2 } as const;
 
 function dateKey(date: Date) {
@@ -222,6 +237,17 @@ function dateKey(date: Date) {
   const m = String(date.getMonth() + 1).padStart(2, "0");
   const d = String(date.getDate()).padStart(2, "0");
   return `${y}-${m}-${d}`;
+}
+
+function currentDateKey() {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/Lisbon",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+  const value = new Map(parts.map((part) => [part.type, part.value]));
+  return `${value.get("year")}-${value.get("month")}-${value.get("day")}`;
 }
 
 function fromKey(key: string) {
@@ -339,6 +365,13 @@ function projectClient(project?: GitLabProject) {
 function formatHours(hours: number) {
   const rounded = Math.round(hours * 100) / 100;
   return `${Number.isInteger(rounded) ? rounded : rounded.toFixed(2).replace(/0$/, "")} h`;
+}
+
+function formatClock(hours: number) {
+  const totalMinutes = Math.round(hours * 60);
+  const hour = Math.floor(totalMinutes / 60) % 24;
+  const minute = totalMinutes % 60;
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
 }
 
 function formatTimer(seconds: number) {
@@ -557,30 +590,24 @@ export default function WorkOrganizer({
 }: {
   user: { displayName: string; email: string };
 }) {
-  const todayKey = dateKey(new Date());
+  const todayKey = currentDateKey();
   const [view, setView] = useState<View>("today");
-  const [tasks, setTasks] = useState<Task[]>(readRealTasks);
-  const [issues, setIssues] = useState<IssueRecord[]>(readIssues);
-  const [logs, setLogs] = useState<WorkLog[]>(readRealLogs);
-  const [meetings, setMeetings] = useState<CalendarMeeting[]>(() =>
-    readStorage("work-organizer.meetings", []),
-  );
+  // Keep the server and browser's first render identical. Browser-only data is
+  // restored after hydration below.
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [issues, setIssues] = useState<IssueRecord[]>([]);
+  const [logs, setLogs] = useState<WorkLog[]>([]);
+  const [meetings, setMeetings] = useState<CalendarMeeting[]>([]);
   const [activeTask, setActiveTask] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [dragged, setDragged] = useState<string | null>(null);
-  const [config, setConfig] = useState<Config>(() =>
-    readStorage("work-organizer.gitlab", {
-      baseUrl: "https://gitlab.ddsdev.deloitte.pt",
-      token: "",
-    }),
-  );
-  const [outlookConfig, setOutlookConfig] = useState<OutlookConfig>(() =>
-    readStorage("work-organizer.outlook", { tenantId: "", clientId: "" }),
-  );
-  const [capacity, setCapacity] = useState<CapacityConfig>(readCapacity);
+  const [config, setConfig] = useState<Config>(DEFAULT_GITLAB_CONFIG);
+  const [outlookConfig, setOutlookConfig] =
+    useState<OutlookConfig>(DEFAULT_OUTLOOK_CONFIG);
+  const [capacity, setCapacity] = useState<CapacityConfig>(DEFAULT_CAPACITY);
   const [projectPreferences, setProjectPreferences] = useState<
     ProjectPreference[]
-  >(() => readStorage("work-organizer.projects", []));
+  >([]);
   const [labelCatalog, setLabelCatalog] = useState<
     Record<string, GitLabLabel[]>
   >({});
@@ -602,26 +629,27 @@ export default function WorkOrganizer({
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [globalSearch, setGlobalSearch] = useState("");
   const [persistenceStatus, setPersistenceStatus] = useState<
-    "loading" | "ready" | "error"
+    "loading" | "ready" | "local"
   >("loading");
   const msalRef = useRef<PublicClientApplication | null>(null);
-  const migrationStateRef = useRef<PersistedState | null>(null);
-  if (migrationStateRef.current == null) {
-    migrationStateRef.current = {
-      version: 1,
-      tasks,
-      issues,
-      logs,
-      meetings,
-      capacity,
-      projectPreferences,
-      labelCatalog,
-    };
-  }
 
   useEffect(() => {
     let cancelled = false;
     async function hydrateFromDatabase() {
+      const localState: PersistedState = {
+        version: 1,
+        tasks: readRealTasks(),
+        issues: readIssues(),
+        logs: readRealLogs(),
+        meetings: readStorage("work-organizer.meetings", []),
+        capacity: readCapacity(),
+        projectPreferences: readStorage("work-organizer.projects", []),
+        labelCatalog: readStorage("work-organizer.labels", {}),
+      };
+      setConfig(readStorage("work-organizer.gitlab", DEFAULT_GITLAB_CONFIG));
+      setOutlookConfig(
+        readStorage("work-organizer.outlook", DEFAULT_OUTLOOK_CONFIG),
+      );
       try {
         const response = await fetch("/api/state", {
           headers: { Accept: "application/json" },
@@ -650,10 +678,19 @@ export default function WorkOrganizer({
           )
             setLabelCatalog(data.state.labelCatalog);
         } else {
+          if (!cancelled) {
+            setTasks(localState.tasks);
+            setIssues(localState.issues);
+            setLogs(localState.logs);
+            setMeetings(localState.meetings);
+            setCapacity(localState.capacity);
+            setProjectPreferences(localState.projectPreferences);
+            setLabelCatalog(localState.labelCatalog);
+          }
           const migration = await fetch("/api/state", {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ state: migrationStateRef.current }),
+            body: JSON.stringify({ state: localState }),
           });
           const result = (await migration.json()) as { error?: string };
           if (!migration.ok)
@@ -664,11 +701,16 @@ export default function WorkOrganizer({
         if (!cancelled) setPersistenceStatus("ready");
       } catch (error) {
         if (!cancelled) {
-          setPersistenceStatus("error");
+          setTasks(localState.tasks);
+          setIssues(localState.issues);
+          setLogs(localState.logs);
+          setMeetings(localState.meetings);
+          setCapacity(localState.capacity);
+          setProjectPreferences(localState.projectPreferences);
+          setLabelCatalog(localState.labelCatalog);
+          setPersistenceStatus("local");
           setToast(
-            error instanceof Error
-              ? error.message
-              : "A base de dados não está disponível.",
+            `${error instanceof Error ? error.message : "A base de dados não está disponível."} Os dados continuam guardados neste browser.`,
           );
         }
       }
@@ -679,7 +721,26 @@ export default function WorkOrganizer({
     };
   }, []);
   useEffect(() => {
-    if (persistenceStatus !== "ready") return;
+    if (persistenceStatus === "loading") return;
+    window.localStorage.setItem("work-organizer.tasks", JSON.stringify(tasks));
+    window.localStorage.setItem("work-organizer.issues", JSON.stringify(issues));
+    window.localStorage.setItem("work-organizer.logs", JSON.stringify(logs));
+    window.localStorage.setItem(
+      "work-organizer.meetings",
+      JSON.stringify(meetings),
+    );
+    window.localStorage.setItem(
+      "work-organizer.capacity",
+      JSON.stringify(capacity),
+    );
+    window.localStorage.setItem(
+      "work-organizer.projects",
+      JSON.stringify(projectPreferences),
+    );
+    window.localStorage.setItem(
+      "work-organizer.labels",
+      JSON.stringify(labelCatalog),
+    );
     const controller = new AbortController();
     const timer = window.setTimeout(async () => {
       try {
@@ -705,9 +766,10 @@ export default function WorkOrganizer({
             data.error ?? "Não foi possível guardar as alterações.",
           );
         }
+        setPersistenceStatus("ready");
       } catch (error) {
         if (controller.signal.aborted) return;
-        setPersistenceStatus("error");
+        setPersistenceStatus("local");
         setToast(
           error instanceof Error
             ? error.message
@@ -743,21 +805,18 @@ export default function WorkOrganizer({
     return () => window.clearTimeout(timer);
   }, [toast]);
 
-  const openedIssueIds = useMemo(
-    () =>
-      new Set(
-        issues
-          .filter((issue) => issue.state === "opened")
-          .map((issue) => issue.id),
-      ),
+  const issueStateById = useMemo(
+    () => new Map(issues.map((issue) => [issue.id, issue.state])),
     [issues],
   );
   const planningTasks = useMemo(
     () =>
       tasks.filter(
-        (task) => task.source === "outlook" || openedIssueIds.has(task.rootId),
+        (task) =>
+          task.source === "outlook" ||
+          issueStateById.get(task.rootId) !== "closed",
       ),
-    [tasks, openedIssueIds],
+    [tasks, issueStateById],
   );
   const todayTasks = planningTasks.filter((task) => task.date === todayKey);
   const todayPlanned = todayTasks.reduce((sum, task) => sum + task.estimate, 0);
@@ -907,6 +966,10 @@ export default function WorkOrganizer({
   }
 
   async function syncGitLab() {
+    if (persistenceStatus === "loading") {
+      notify("Aguarda enquanto o planeamento guardado é aberto.");
+      return;
+    }
     if (!config.token) {
       setView("settings");
       setSettingsSection("gitlab");
@@ -1142,7 +1205,97 @@ export default function WorkOrganizer({
     }
   }
 
+  function replaceImportedMeetings(events: CalendarMeeting[]) {
+    const previous = new Map(meetings.map((meeting) => [meeting.id, meeting]));
+    const imported = events.map((event) => {
+      const saved = previous.get(event.id);
+      return {
+        ...event,
+        projectId: saved?.projectId,
+        linkedIssueId: saved?.linkedIssueId,
+        linkedIssueIid: saved?.linkedIssueIid,
+        linkedIssueWebUrl: saved?.linkedIssueWebUrl,
+      };
+    });
+    const importedRootIds = new Set(
+      imported.map((meeting) => `outlook-${meeting.id}`),
+    );
+    const importedMeetingIds = new Set(
+      imported.map((meeting) => meeting.id),
+    );
+    const importEnd = addDays(todayKey, 36);
+    const isInImportWindow = (value: string) =>
+      value >= todayKey && value < importEnd;
+    const removedLinkedIssueIds = new Set(
+      meetings
+        .filter(
+          (meeting) =>
+            isInImportWindow(meeting.start.slice(0, 10)) &&
+            !importedMeetingIds.has(meeting.id) &&
+            meeting.linkedIssueId,
+        )
+        .map((meeting) => meeting.linkedIssueId!),
+    );
+    const meetingTasks = imported.flatMap((meeting): Task[] => {
+      if (meeting.linkedIssueId) return [];
+      const project = projects.find(
+        (item) => item.projectId === meeting.projectId,
+      );
+      const start = new Date(meeting.start);
+      const end = new Date(meeting.end);
+      return [
+        {
+          id: `outlook-${meeting.id}`,
+          rootId: `outlook-${meeting.id}`,
+          allocationId: `outlook-${meeting.id}`,
+          projectId: project?.projectId ?? 0,
+          iid: 0,
+          title: meeting.subject,
+          client: project?.client ?? "Outlook",
+          project: project?.project ?? "Reuniões",
+          color: project?.color ?? "#3977d5",
+          date: meeting.start.slice(0, 10),
+          start: start.getHours() + start.getMinutes() / 60,
+          estimate: Math.max(
+            0.25,
+            (end.getTime() - start.getTime()) / 3_600_000,
+          ),
+          spent: 0,
+          due: "Reunião",
+          dueDate: meeting.start.slice(0, 10),
+          type: "Reunião",
+          phase: "Reunião",
+          priority: "Normal",
+          fixed: true,
+          webUrl: meeting.joinUrl ?? meeting.webUrl,
+          source: "outlook",
+        },
+      ];
+    });
+    setMeetings(imported);
+    setTasks((current) => [
+      ...current.filter((task) => {
+        if (importedRootIds.has(task.rootId)) return false;
+        if (task.source === "outlook" && isInImportWindow(task.date))
+          return false;
+        if (
+          removedLinkedIssueIds.has(task.rootId) &&
+          task.fixed &&
+          task.phase === "Reunião"
+        )
+          return false;
+        return true;
+      }),
+      ...meetingTasks,
+    ]);
+    return imported;
+  }
+
   async function syncOutlook() {
+    if (persistenceStatus === "loading") {
+      notify("Aguarda enquanto o planeamento guardado é aberto.");
+      return;
+    }
     setSyncingCalendar(true);
     try {
       const msal = await getMsal();
@@ -1168,7 +1321,8 @@ export default function WorkOrganizer({
         endDateTime: end.toISOString(),
         $orderby: "start/dateTime",
         $top: "200",
-        $select: "id,subject,start,end,webLink,isOnlineMeeting,onlineMeeting",
+        $select:
+          "id,subject,start,end,webLink,isOnlineMeeting,onlineMeeting,isCancelled,responseStatus",
       });
       const response = await fetch(
         `https://graph.microsoft.com/v1.0/me/calendarView?${params}`,
@@ -1184,28 +1338,33 @@ export default function WorkOrganizer({
         throw new Error(
           data.error?.message ?? "Não foi possível ler o calendário.",
         );
-      const previous = new Map(
-        meetings.map((meeting) => [meeting.id, meeting.projectId]),
-      );
-      const imported = (data.value ?? []).map(
-        (event: {
+      const outlookEvents = (data.value ?? []) as Array<{
           id: string;
           subject?: string;
           start: { dateTime: string };
           end: { dateTime: string };
           webLink?: string;
           onlineMeeting?: { joinUrl?: string };
-        }) => ({
+          isCancelled?: boolean;
+          responseStatus?: { response?: string };
+        }>;
+      const events = outlookEvents
+        .filter(
+          (event) =>
+            !event.isCancelled &&
+            ["accepted", "organizer"].includes(
+              event.responseStatus?.response ?? "",
+            ),
+        )
+        .map((event) => ({
           id: event.id,
           subject: event.subject || "Reunião sem título",
           start: event.start.dateTime,
           end: event.end.dateTime,
           webUrl: event.webLink,
           joinUrl: event.onlineMeeting?.joinUrl,
-          projectId: previous.get(event.id),
-        }),
-      );
-      setMeetings(imported);
+        }));
+      const imported = replaceImportedMeetings(events);
       setOutlookConnection({
         state: "ok",
         message: `${imported.length} reuniões importadas para os próximos 35 dias.`,
@@ -1227,6 +1386,10 @@ export default function WorkOrganizer({
   }
 
   async function syncLocalOutlook() {
+    if (persistenceStatus === "loading") {
+      notify("Aguarda enquanto o planeamento guardado é aberto.");
+      return;
+    }
     setSyncingCalendar(true);
     setOutlookConnection({
       state: "loading",
@@ -1241,14 +1404,7 @@ export default function WorkOrganizer({
         throw new Error(
           data.error ?? "A ponte local do Outlook devolveu um erro.",
         );
-      const previous = new Map(
-        meetings.map((meeting) => [meeting.id, meeting.projectId]),
-      );
-      const imported = (data.events ?? []).map((event: CalendarMeeting) => ({
-        ...event,
-        projectId: previous.get(event.id),
-      }));
-      setMeetings(imported);
+      const imported = replaceImportedMeetings(data.events ?? []);
       setOutlookConnection({
         state: "ok",
         message: `${imported.length} reuniões lidas do Outlook clássico.`,
@@ -1258,7 +1414,9 @@ export default function WorkOrganizer({
       );
     } catch (error) {
       const message =
-        error instanceof Error
+        error instanceof TypeError && error.message === "Failed to fetch"
+          ? "Não foi possível contactar a ponte local. Autoriza o acesso à rede local se o browser o pedir."
+          : error instanceof Error
           ? error.message
           : "Não foi possível contactar a ponte local.";
       setOutlookConnection({
@@ -1281,7 +1439,7 @@ export default function WorkOrganizer({
       const without = all.filter(
         (task) => task.rootId !== `outlook-${meetingId}`,
       );
-      if (!meeting || !projectId) return without;
+      if (!meeting || !projectId || meeting.linkedIssueId) return without;
       const project = projects.find((item) => item.projectId === projectId);
       if (!project) return without;
       const start = new Date(meeting.start);
@@ -1468,16 +1626,63 @@ export default function WorkOrganizer({
       issue,
       ...current.filter((item) => item.id !== issue.id),
     ]);
-    saveAllocationForIssue(issue, {
-      issueId: issue.id,
-      phase: draft.phase,
-      hours: draft.hours,
-      date: draft.date,
-      start: draft.start,
-      distribution: draft.distribution,
-      description: draft.description,
-    });
-    notify(`Tarefa #${issue.iid} criada no GitLab e adicionada à Timeline.`);
+    if (draft.meetingId) {
+      const meetingRootId = `outlook-${draft.meetingId}`;
+      setMeetings((current) =>
+        current.map((meeting) =>
+          meeting.id === draft.meetingId
+            ? {
+                ...meeting,
+                projectId: issue.projectId,
+                linkedIssueId: issue.id,
+                linkedIssueIid: issue.iid,
+                linkedIssueWebUrl: issue.webUrl,
+              }
+            : meeting,
+        ),
+      );
+      setTasks((current) =>
+        current.map((task) =>
+          task.rootId === meetingRootId
+            ? {
+                ...task,
+                rootId: issue.id,
+                projectId: issue.projectId,
+                iid: issue.iid,
+                title: issue.title,
+                client: issue.client,
+                project: issue.project,
+                color: issue.color,
+                due: issue.due,
+                dueDate: issue.dueDate,
+                type: "Reunião",
+                phase: "Reunião",
+                description: draft.description.trim(),
+                priority: issue.priority,
+                fixed: true,
+                webUrl: issue.webUrl,
+                source: "gitlab",
+                hasEstimate: issue.hasEstimate,
+                labels: issue.labels,
+              }
+            : task,
+        ),
+      );
+      notify(
+        `US #${issue.iid} criada para a reunião. O cronómetro passa a registar spent no GitLab.`,
+      );
+    } else {
+      saveAllocationForIssue(issue, {
+        issueId: issue.id,
+        phase: draft.phase,
+        hours: draft.hours,
+        date: draft.date,
+        start: draft.start,
+        distribution: draft.distribution,
+        description: draft.description,
+      });
+      notify(`Tarefa #${issue.iid} criada no GitLab e adicionada à Timeline.`);
+    }
   }
 
   function deleteAllocation(allocationId: string) {
@@ -1547,11 +1752,19 @@ export default function WorkOrganizer({
     setElapsed(0);
   }
 
-  function moveTask(allocationId: string, targetDate: string) {
+  function moveTask(
+    allocationId: string,
+    targetDate: string,
+    targetStart?: number,
+  ) {
     setTasks((all) => {
       const rootTasks = all
         .filter((task) => task.allocationId === allocationId)
         .sort((a, b) => a.date.localeCompare(b.date) || a.start - b.start);
+      const startDelta =
+        targetStart == null || !rootTasks.length
+          ? 0
+          : targetStart - rootTasks[0].start;
       const sourceDates = [...new Set(rootTasks.map((task) => task.date))];
       const targetBySource = new Map(
         sourceDates.map((sourceDate, index) => [
@@ -1561,7 +1774,11 @@ export default function WorkOrganizer({
       );
       return all.map((task) =>
         task.allocationId === allocationId
-          ? { ...task, date: targetBySource.get(task.date) ?? targetDate }
+          ? {
+              ...task,
+              date: targetBySource.get(task.date) ?? targetDate,
+              start: Math.max(0, Math.min(23.75, task.start + startDelta)),
+            }
           : task,
       );
     });
@@ -1663,10 +1880,10 @@ export default function WorkOrganizer({
             <strong>{user.displayName}</strong>
             <small>
               {persistenceStatus === "ready"
-                ? "Dados guardados"
+                ? "Dados guardados na BD"
                 : persistenceStatus === "loading"
                   ? "A abrir dados…"
-                  : "Erro ao guardar"}
+                  : "Guardado neste browser"}
             </small>
           </div>
           <button
@@ -1895,6 +2112,7 @@ export default function WorkOrganizer({
             planned={todayPlanned}
             spent={todaySpent}
             dailyHours={capacity.dailyHours}
+            todayKey={todayKey}
             activeTask={activeTask}
             elapsed={elapsed}
             startTimer={startTimer}
@@ -2063,6 +2281,7 @@ function TodayView({
   planned,
   spent,
   dailyHours,
+  todayKey,
   activeTask,
   elapsed,
   startTimer,
@@ -2073,6 +2292,7 @@ function TodayView({
   planned: number;
   spent: number;
   dailyHours: number;
+  todayKey: string;
   activeTask: string | null;
   elapsed: number;
   startTimer: (id: string) => void;
@@ -2083,7 +2303,7 @@ function TodayView({
   return (
     <div className="page">
       <PageIntro
-        eyebrow={`${WEEKDAYS[new Date().getDay()]} · ${formatDate(dateKey(new Date()), true).toUpperCase()}`}
+        eyebrow={`${WEEKDAYS[fromKey(todayKey).getDay()]} · ${formatDate(todayKey, true).toUpperCase()}`}
         title="Bom dia, Nuno."
         description={
           planned >= dailyHours
@@ -2215,6 +2435,13 @@ function TodayView({
                               Parar
                             </button>
                           </>
+                        ) : task.source === "outlook" ? (
+                          <button
+                            className="play-button"
+                            onClick={() => setView("timeline")}
+                          >
+                            Criar US
+                          </button>
                         ) : complete ? (
                           <span className="complete-pill">✓ Realizada</span>
                         ) : (
@@ -2296,6 +2523,43 @@ type TimelineBar = {
   totalHours: number;
   totalDays: number;
 };
+
+type AgendaItem = {
+  task: Task;
+  column: number;
+  columnCount: number;
+};
+
+function layoutAgendaDay(tasks: Task[]): AgendaItem[] {
+  const ordered = [...tasks].sort(
+    (a, b) => a.start - b.start || b.estimate - a.estimate,
+  );
+  const clusters: Task[][] = [];
+  let cluster: Task[] = [];
+  let clusterEnd = -1;
+  ordered.forEach((task) => {
+    if (cluster.length && task.start >= clusterEnd - 0.001) {
+      clusters.push(cluster);
+      cluster = [];
+      clusterEnd = -1;
+    }
+    cluster.push(task);
+    clusterEnd = Math.max(clusterEnd, task.start + task.estimate);
+  });
+  if (cluster.length) clusters.push(cluster);
+
+  return clusters.flatMap((items) => {
+    const columnEnds: number[] = [];
+    const positioned = items.map((task) => {
+      let column = columnEnds.findIndex((end) => end <= task.start + 0.001);
+      if (column < 0) column = columnEnds.length;
+      columnEnds[column] = task.start + task.estimate;
+      return { task, column };
+    });
+    const columnCount = Math.max(1, columnEnds.length);
+    return positioned.map((item) => ({ ...item, columnCount }));
+  });
+}
 
 function buildTimelineBars(
   tasks: Task[],
@@ -2423,7 +2687,7 @@ function TimelineView({
   loadProjectLabels: (projectId: number) => Promise<GitLabLabel[]>;
   dragged: string | null;
   setDragged: (id: string | null) => void;
-  moveTask: (id: string, date: string) => void;
+  moveTask: (id: string, date: string, start?: number) => void;
   saveAllocation: (draft: AllocationDraft) => void;
   createIssueAndAllocate: (draft: CreateIssueDraft) => Promise<void>;
   deleteAllocation: (id: string) => void;
@@ -2491,7 +2755,11 @@ function TimelineView({
         a.title.localeCompare(b.title),
     );
 
-  function openNew(issue: IssueRecord, date = todayKey) {
+  function openNew(
+    issue: IssueRecord,
+    date = todayKey,
+    start = capacity.startHour,
+  ) {
     const alreadyPlanned = plannedByIssue.get(issue.id) ?? 0;
     const suggestion =
       issue.estimateTotal > 0
@@ -2502,7 +2770,7 @@ function TimelineView({
       phase: defaultPhase(issue),
       hours: suggestion,
       date,
-      start: capacity.startHour,
+      start,
       distribution: suggestion > capacity.dailyHours ? "automatic" : "manual",
       description: "",
     });
@@ -2512,7 +2780,30 @@ function TimelineView({
     const segments = tasks
       .filter((task) => task.allocationId === allocationId)
       .sort((a, b) => a.date.localeCompare(b.date) || a.start - b.start);
-    if (!segments.length || segments[0].source !== "gitlab") return;
+    if (!segments.length) return;
+    if (segments[0].source === "outlook") {
+      const task = segments[0];
+      const project =
+        gitlabProjects.find((item) => item.projectId === task.projectId) ??
+        gitlabProjects.find((item) => item.projectId > 0);
+      if (!project) return;
+      setCreateError("");
+      setCreateEditor({
+        projectId: project.projectId,
+        title: task.title,
+        description: `Reunião Outlook de ${formatHours(task.estimate)} em ${formatDate(task.date, true)}.`,
+        estimateHours: task.estimate,
+        phase: "Reunião",
+        hours: task.estimate,
+        date: task.date,
+        start: task.start,
+        distribution: "manual",
+        labels: [],
+        meetingId: task.rootId.slice("outlook-".length),
+      });
+      refreshProjectLabels(project.projectId);
+      return;
+    }
     setEditor({
       issueId: segments[0].rootId,
       allocationId,
@@ -2526,7 +2817,9 @@ function TimelineView({
   }
 
   function openCreateIssue(date = todayKey) {
-    const firstProject = gitlabProjects[0];
+    const firstProject = gitlabProjects.find(
+      (project) => project.projectId > 0,
+    );
     if (!firstProject) return;
     setCreateError("");
     setCreateEditor({
@@ -2598,9 +2891,45 @@ function TimelineView({
     setDragged(null);
   }
 
+  function dropOnAgenda(
+    day: string,
+    event: DragEvent<HTMLDivElement>,
+    agendaStart: number,
+    hourHeight: number,
+  ) {
+    if (!dragged) return;
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const rawStart = agendaStart + (event.clientY - bounds.top) / hourHeight;
+    const start = Math.max(
+      agendaStart,
+      Math.round(rawStart * 4) / 4,
+    );
+    if (dragged.startsWith("issue:")) {
+      const issue = issues.find((item) => item.id === dragged.slice(6));
+      if (issue) openNew(issue, day, start);
+    } else if (dragged.startsWith("allocation:")) {
+      moveTask(dragged.slice(11), day, start);
+    }
+    setDragged(null);
+  }
+
   const editingIssue = editor
     ? issues.find((issue) => issue.id === editor.issueId)
     : undefined;
+  const agendaHourHeight = 64;
+  // A calendar is always a complete day. Capacity is an alert, never a visual
+  // boundary for meetings or planned work.
+  const agendaStart = 0;
+  const agendaEnd = 24;
+  const agendaHours = Array.from(
+    { length: agendaEnd - agendaStart + 1 },
+    (_, index) => agendaStart + index,
+  );
+  const agendaHeight = (agendaEnd - agendaStart) * agendaHourHeight;
+  const agendaGridStyle = {
+    minWidth: 68 + days.length * (zoom === "day" ? 420 : 155),
+    gridTemplateColumns: `68px repeat(${days.length}, minmax(${zoom === "day" ? 420 : 155}px, 1fr))`,
+  };
 
   return (
     <div className="page wide-page">
@@ -2615,7 +2944,7 @@ function TimelineView({
         <button
           className="primary-button"
           onClick={() => openCreateIssue()}
-          disabled={!gitlabProjects.length}
+          disabled={!gitlabProjects.some((project) => project.projectId > 0)}
         >
           + Criar tarefa GitLab
         </button>
@@ -2771,6 +3100,123 @@ function TimelineView({
               </div>
             </div>
           </section>
+          {zoom !== "month" && (
+            <section className="agenda-timeline panel">
+              <div className="agenda-head" style={agendaGridStyle}>
+                <div className="agenda-time-head">HORA</div>
+                {days.map((key) => {
+                  const day = fromKey(key);
+                  const hours = tasks
+                    .filter((task) => task.date === key)
+                    .reduce((sum, task) => sum + task.estimate, 0);
+                  return (
+                    <div
+                      className={`agenda-day-head ${key === todayKey ? "today" : ""}`}
+                      key={key}
+                    >
+                      <span>{WEEKDAYS[day.getDay()]}</span>
+                      <strong>{String(day.getDate()).padStart(2, "0")}</strong>
+                      <small>{MONTHS[day.getMonth()]}</small>
+                      <em
+                        className={
+                          hours > capacity.dailyHours ? "over" : undefined
+                        }
+                      >
+                        {formatHours(hours)} / {formatHours(capacity.dailyHours)}
+                      </em>
+                    </div>
+                  );
+                })}
+              </div>
+              <div className="agenda-scroll">
+                <div
+                  className="agenda-body"
+                  style={{ ...agendaGridStyle, height: agendaHeight }}
+                >
+                  <div className="agenda-time-axis">
+                    {agendaHours.map((hour) => (
+                      <span
+                        key={hour}
+                        style={{ top: (hour - agendaStart) * agendaHourHeight }}
+                      >
+                        {formatClock(hour)}
+                      </span>
+                    ))}
+                  </div>
+                  {days.map((day) => {
+                    const items = layoutAgendaDay(
+                      tasks.filter((task) => task.date === day),
+                    );
+                    return (
+                      <div
+                        key={day}
+                        className={`agenda-day-column ${day === todayKey ? "today" : ""} ${dragged ? "drop-ready" : ""}`}
+                        onDragOver={(event) => event.preventDefault()}
+                        onDrop={(event) =>
+                          dropOnAgenda(
+                            day,
+                            event,
+                            agendaStart,
+                            agendaHourHeight,
+                          )
+                        }
+                      >
+                        {items.map(({ task, column, columnCount }) => {
+                          const start = Math.max(task.start, agendaStart);
+                          const end = Math.min(
+                            task.start + task.estimate,
+                            agendaEnd,
+                          );
+                          return (
+                            <article
+                              key={task.id}
+                              className={`agenda-event ${task.fixed ? "fixed" : ""}`}
+                              style={{
+                                borderColor: task.color,
+                                top: (start - agendaStart) * agendaHourHeight,
+                                height: Math.max(
+                                  24,
+                                  (end - start) * agendaHourHeight,
+                                ),
+                                left: `calc(${(column / columnCount) * 100}% + 3px)`,
+                                width: `calc(${100 / columnCount}% - 6px)`,
+                              }}
+                              draggable={!task.fixed}
+                              onClick={() => openEdit(task.allocationId)}
+                              onDragStart={() => {
+                                if (!task.fixed)
+                                  setDragged(
+                                    `allocation:${task.allocationId}`,
+                                  );
+                              }}
+                              onDragEnd={() => setDragged(null)}
+                              title={`${formatClock(task.start)}–${formatClock(task.start + task.estimate)} · ${task.title}`}
+                            >
+                              <div>
+                                <span>
+                                  {formatClock(task.start)}–
+                                  {formatClock(task.start + task.estimate)}
+                                </span>
+                                <small>{formatHours(task.estimate)}</small>
+                              </div>
+                              <strong>{task.title}</strong>
+                              <p>
+                                {task.client} · {task.project}
+                                {task.source === "outlook"
+                                  ? " · Criar US"
+                                  : ` · #${task.iid}`}
+                              </p>
+                            </article>
+                          );
+                        })}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </section>
+          )}
+          {zoom === "month" && (
           <section className="timeline panel">
             <div className="timeline-head" style={gridStyle}>
               <div className="timeline-client-head">CLIENTE / PROJETO</div>
@@ -2878,7 +3324,7 @@ function TimelineView({
                             <span style={{ color: bar.task.color }}>
                               {bar.task.iid
                                 ? `#${bar.task.iid} · ${bar.task.phase}`
-                                : "OUTLOOK"}
+                                : "OUTLOOK · CRIAR US"}
                             </span>
                             <small>{formatHours(bar.totalHours)}</small>
                           </div>
@@ -2949,9 +3395,12 @@ function TimelineView({
               </div>
             </div>
           </section>
+          )}
           <p className="timeline-hint">
-            <span>↔</span> Arrasta uma US do backlog para um dia ou cria várias
-            fases para a mesma US.
+            <span>↔</span>{" "}
+            {zoom === "month"
+              ? "Arrasta uma US do backlog para um dia."
+              : "Arrasta uma US para uma hora livre; o horário ajusta-se em intervalos de 15 minutos."}
           </p>
         </div>
       </div>
@@ -3078,8 +3527,8 @@ function TimelineView({
                 <span>Hora inicial</span>
                 <input
                   type="time"
-                  step="1800"
-                  value={`${String(Math.floor(editor.start)).padStart(2, "0")}:${editor.start % 1 ? "30" : "00"}`}
+                  step="900"
+                  value={formatClock(editor.start)}
                   onChange={(event) => {
                     const [hour, minute] = event.target.value
                       .split(":")
@@ -3165,8 +3614,16 @@ function TimelineView({
           >
             <div className="allocation-modal-head">
               <div>
-                <span>NOVA TAREFA GITLAB + ALOCAÇÃO</span>
-                <h2 id="create-task-title">Criar e planear num único passo</h2>
+                <span>
+                  {createEditor.meetingId
+                    ? "REUNIÃO OUTLOOK → US GITLAB"
+                    : "NOVA TAREFA GITLAB + ALOCAÇÃO"}
+                </span>
+                <h2 id="create-task-title">
+                  {createEditor.meetingId
+                    ? "Criar US para esta reunião"
+                    : "Criar e planear num único passo"}
+                </h2>
                 <p>
                   A tarefa fica atribuída a ti no GitLab e entra imediatamente
                   na Timeline.
@@ -3195,11 +3652,16 @@ function TimelineView({
                     refreshProjectLabels(projectId);
                   }}
                 >
-                  {gitlabProjects.map((project) => (
-                    <option key={project.projectId} value={project.projectId}>
-                      {project.client} · {project.project}
-                    </option>
-                  ))}
+                  {gitlabProjects
+                    .filter((project) => project.projectId > 0)
+                    .map((project) => (
+                      <option
+                        key={project.projectId}
+                        value={project.projectId}
+                      >
+                        {project.client} · {project.project}
+                      </option>
+                    ))}
                 </select>
               </label>
               <label className="allocation-description">
@@ -3326,8 +3788,8 @@ function TimelineView({
                 <span>Hora inicial</span>
                 <input
                   type="time"
-                  step="1800"
-                  value={`${String(Math.floor(createEditor.start)).padStart(2, "0")}:${createEditor.start % 1 ? "30" : "00"}`}
+                  step="900"
+                  value={formatClock(createEditor.start)}
                   onChange={(event) => {
                     const [hour, minute] = event.target.value
                       .split(":")
@@ -3398,7 +3860,9 @@ function TimelineView({
               >
                 {creatingIssue
                   ? "A criar no GitLab…"
-                  : "Criar e adicionar à Timeline"}
+                  : createEditor.meetingId
+                    ? "Criar US da reunião"
+                    : "Criar e adicionar à Timeline"}
               </button>
             </div>
           </section>
@@ -4085,7 +4549,10 @@ function SettingsView(props: {
             <div className="panel-head">
               <div>
                 <h2>Reuniões importadas</h2>
-                <p>Associa a um projeto para ocupar capacidade na Timeline.</p>
+                <p>
+                  Já estão na Timeline. Associa um projeto e clica no bloco para
+                  criar a respetiva US.
+                </p>
               </div>
               <span className="total-pill">{meetings.length}</span>
             </div>
@@ -4106,6 +4573,7 @@ function SettingsView(props: {
                   </div>
                   <select
                     value={meeting.projectId ?? ""}
+                    disabled={Boolean(meeting.linkedIssueId)}
                     onChange={(event) =>
                       associateMeeting(
                         meeting.id,
@@ -4116,12 +4584,27 @@ function SettingsView(props: {
                     }
                   >
                     <option value="">Sem projeto</option>
-                    {projects.map((project) => (
-                      <option key={project.projectId} value={project.projectId}>
-                        {project.client} · {project.project}
-                      </option>
-                    ))}
+                    {projects
+                      .filter((project) => project.projectId > 0)
+                      .map((project) => (
+                        <option
+                          key={project.projectId}
+                          value={project.projectId}
+                        >
+                          {project.client} · {project.project}
+                        </option>
+                      ))}
                   </select>
+                  {meeting.linkedIssueWebUrl && meeting.linkedIssueIid && (
+                    <a
+                      href={meeting.linkedIssueWebUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      aria-label={`Abrir US ${meeting.linkedIssueIid}`}
+                    >
+                      #{meeting.linkedIssueIid}
+                    </a>
+                  )}
                   {(meeting.joinUrl || meeting.webUrl) && (
                     <a
                       href={meeting.joinUrl ?? meeting.webUrl}
