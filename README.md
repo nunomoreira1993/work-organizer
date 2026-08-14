@@ -8,6 +8,8 @@ Planeamento pessoal de trabalho alimentado por Issues do GitLab e reuniões do O
 - Timeline diária, semanal e mensal com planeamento por capacidade;
 - cronómetro com registo de `spent time` no GitLab;
 - trabalho realizado, pesquisa, notificações e analytics;
+- pesquisa de US com filtros pesquisáveis e multisseleção de projetos, labels e responsáveis;
+- alocação semanal da equipa numa grelha de 40 horas, com drag-and-drop, exportação CSV e cópia para e-mail;
 - importação do Outlook clássico instalado no Windows, sem App Registration;
 - alternativa Microsoft Graph para organizações que autorizem uma App Registration;
 - configuração no próprio browser, sem editar `.env`.
@@ -26,6 +28,28 @@ npm run dev:windows
 Abre `http://localhost:3000`. Em **Definições → Integração GitLab**, introduz a URL e um Personal Access Token com scope `api`. As credenciais ficam no armazenamento local do browser e não são versionadas.
 
 ## Outlook clássico sem Microsoft Entra
+
+### Aplicação Windows (um clique)
+
+Instala uma vez o atalho no Ambiente de Trabalho e no menu Iniciar:
+
+```powershell
+npm run app:install:windows
+```
+
+Depois abre **Work Organizer** pelo novo ícone. O lançador inicia a ponte do
+Outlook silenciosamente, se ainda não estiver ativa, e abre a aplicação numa
+janela própria. Já não é necessário executar manualmente `npm run
+outlook:bridge` nem manter uma consola aberta.
+
+Por omissão, o atalho inicia e abre a aplicação local em `127.0.0.1:3000`. O
+modo local usa uma identidade interna e não apresenta nem exige login do
+ChatGPT. Para apontar para outro endereço, define a variável de ambiente
+`WORK_ORGANIZER_URL` antes de o abrir.
+
+O planeamento local é guardado em `data/work-organizer.sqlite`. Ao iniciar, a
+aplicação cria também uma cópia de segurança diária em `backups/`. Estes dois
+diretórios contêm dados pessoais e ficam excluídos do Git.
 
 Numa segunda janela PowerShell, dentro da pasta do projeto:
 

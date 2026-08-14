@@ -12,10 +12,13 @@
     "build": "bash scripts/build-verified.sh",
     "start": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext start",
     "start:windows": "vinext start",
+    "start:local:windows": "node tools/local-app-server.mjs",
     "test": "npm run build && node --test tests/rendered-html.test.mjs",
     "validate:artifact": "bash scripts/validate-artifact.sh",
     "lint": "bash scripts/sites-env.sh -- eslint . --ignore-pattern dist --ignore-pattern .next",
     "outlook:bridge": "node tools/outlook-bridge.mjs",
+    "app:open:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/launch-windows-app.ps1",
+    "app:install:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-windows-app.ps1",
     "db:generate": "bash scripts/sites-env.sh -- drizzle-kit generate"
   },
   "dependencies": {

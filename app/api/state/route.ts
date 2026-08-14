@@ -1,7 +1,7 @@
 import { eq } from "drizzle-orm";
 import { getDb } from "../../../db";
 import { organizerSnapshots } from "../../../db/schema";
-import { getChatGPTUser } from "../../chatgpt-auth";
+import { getChatGPTUser, isLocalOrganizer } from "../../chatgpt-auth";
 
 const MAX_STATE_BYTES = 5 * 1024 * 1024;
 
@@ -24,6 +24,10 @@ function databaseError(error: unknown) {
 }
 
 export async function GET() {
+  if (isLocalOrganizer()) {
+    return Response.json({ state: null, storage: "browser" });
+  }
+
   const email = await ownerEmail();
   if (!email) return Response.json({ error: "Inicia sessão para aceder ao planeamento." }, { status: 401 });
 
@@ -41,6 +45,10 @@ export async function GET() {
 }
 
 export async function PUT(request: Request) {
+  if (isLocalOrganizer()) {
+    return Response.json({ ok: true, storage: "browser" });
+  }
+
   const email = await ownerEmail();
   if (!email) return Response.json({ error: "Inicia sessão para guardar o planeamento." }, { status: 401 });
 

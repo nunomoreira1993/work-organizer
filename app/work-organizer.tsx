@@ -6,10 +6,12 @@ import {
   useMemo,
   useRef,
   useState,
+  type Dispatch,
   type DragEvent,
+  type SetStateAction,
 } from "react";
 
-type View = "today" | "timeline" | "completed" | "analytics" | "settings";
+type View = "today" | "issues" | "team" | "timeline" | "completed" | "analytics" | "settings";
 type Zoom = "day" | "week" | "month";
 type SettingsSection = "gitlab" | "calendar" | "capacity" | "clients";
 type TaskSource = "gitlab" | "outlook";
@@ -29,6 +31,14 @@ type GitLabLabel = {
   description?: string | null;
 };
 
+type GitLabAssignee = {
+  id: number;
+  name?: string;
+  username?: string;
+  avatarUrl?: string;
+  webUrl?: string;
+};
+
 type Task = {
   id: string;
   rootId: string;
@@ -45,6 +55,7 @@ type Task = {
   spent: number;
   due: string;
   dueDate?: string | null;
+  closedAt?: string | null;
   type: string;
   phase: WorkPhase;
   description?: string;
@@ -54,6 +65,7 @@ type Task = {
   source: TaskSource;
   hasEstimate?: boolean;
   labels?: GitLabLabel[];
+  assignees?: GitLabAssignee[];
 };
 
 type IssueRecord = {
@@ -61,6 +73,7 @@ type IssueRecord = {
   projectId: number;
   iid: number;
   title: string;
+  description?: string;
   client: string;
   project: string;
   color: string;
@@ -71,15 +84,20 @@ type IssueRecord = {
   assigneeCount: number;
   due: string;
   dueDate?: string | null;
+  closedAt?: string | null;
   type: string;
   priority: Task["priority"];
   webUrl?: string;
   hasEstimate: boolean;
   labels: GitLabLabel[];
+  assignees: GitLabAssignee[];
 };
 
 type AllocationDraft = {
   issueId: string;
+  projectId?: number;
+  labels?: string[];
+  issueDescription?: string;
   allocationId?: string;
   phase: WorkPhase;
   hours: number;
@@ -87,6 +105,7 @@ type AllocationDraft = {
   start: number;
   distribution: "manual" | "automatic";
   description: string;
+  issueState?: "opened" | "closed";
 };
 
 type CreateIssueDraft = {
@@ -100,6 +119,7 @@ type CreateIssueDraft = {
   start: number;
   distribution: "manual" | "automatic";
   labels: string[];
+  relatedIssueIds: string[];
   meetingId?: string;
 };
 
@@ -109,13 +129,14 @@ type WorkLog = {
   client: string;
   project: string;
   task: string;
+  description?: string;
   type: string;
   hours: number;
   estimate?: number;
   webUrl?: string;
   projectId?: number;
   issueIid?: number;
-  source?: "gitlab" | "timer";
+  source?: "gitlab" | "timer" | "closed" | "timeline";
 };
 
 type Config = { baseUrl: string; token: string };
@@ -145,6 +166,23 @@ type CalendarMeeting = {
   linkedIssueWebUrl?: string;
 };
 
+type TeamMember = {
+  id: string;
+  name: string;
+  role?: string;
+};
+
+type TeamAllocation = {
+  id: string;
+  memberId: string;
+  issueId?: string;
+  customTitle?: string;
+  customColor?: string;
+  weekStart: string;
+  startSlot: number;
+  hours: number;
+};
+
 type PersistedState = {
   version: 1;
   tasks: Task[];
@@ -154,19 +192,28 @@ type PersistedState = {
   capacity: CapacityConfig;
   projectPreferences: ProjectPreference[];
   labelCatalog: Record<string, GitLabLabel[]>;
+  teamMembers: TeamMember[];
+  teamAllocations: TeamAllocation[];
 };
 
 type GitLabIssue = {
   project_id: number;
   iid: number;
   title: string;
+  description?: string | null;
   state: "opened" | "closed";
   web_url?: string;
   due_date?: string | null;
   closed_at?: string | null;
   updated_at?: string;
   labels?: string[];
-  assignees?: { id: number; username?: string }[];
+  assignees?: {
+    id: number;
+    name?: string;
+    username?: string;
+    avatar_url?: string;
+    web_url?: string;
+  }[];
   time_stats?: { time_estimate?: number; total_time_spent?: number };
 };
 
@@ -230,6 +277,13 @@ const DEFAULT_GITLAB_CONFIG: Config = {
   token: "",
 };
 const DEFAULT_OUTLOOK_CONFIG: OutlookConfig = { tenantId: "", clientId: "" };
+const DEFAULT_TEAM_MEMBERS: TeamMember[] = [
+  { id: "neuza-santos", name: "Neuza Santos" },
+  { id: "nuno-moreira", name: "Nuno Moreira" },
+  { id: "andre-carvalho", name: "André Carvalho" },
+  { id: "fabio-cerqueira", name: "Fabio Cerqueira", role: "Dev 5" },
+  { id: "goncalo-duarte", name: "Gonçalo Duarte", role: "Dev 5" },
+];
 const priorityOrder = { Alta: 0, Média: 1, Normal: 2 } as const;
 
 function dateKey(date: Date) {
@@ -430,6 +484,16 @@ function labelsForIssue(names: string[] = [], catalog: GitLabLabel[] = []) {
   return names.map((name) => byName.get(name) ?? normaliseLabel(name));
 }
 
+function assigneesForIssue(issue: GitLabIssue): GitLabAssignee[] {
+  return (issue.assignees ?? []).map((assignee) => ({
+    id: assignee.id,
+    name: assignee.name,
+    username: assignee.username,
+    avatarUrl: assignee.avatar_url,
+    webUrl: assignee.web_url,
+  }));
+}
+
 function planTasks(
   input: Task[],
   startKey = dateKey(new Date()),
@@ -505,8 +569,76 @@ function planTasks(
   return result;
 }
 
+const RELATED_STOP_WORDS = new Set([
+  "para", "com", "sem", "uma", "uns", "das", "dos", "que", "por", "nos",
+  "nas", "este", "esta", "isto", "isso", "como", "mais", "menos", "deve",
+  "ser", "ter", "fazer", "criar", "adicionar", "alterar", "quando", "onde",
+  "the", "and", "for", "from", "with", "this", "that", "into", "issue",
+]);
+
+function relatedTerms(text: string) {
+  const plain = text
+    .replace(/`[^`]*`/g, " ")
+    .replace(/https?:\/\/\S+/g, " ")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+  return new Set(
+    plain
+      .split(/[^a-z0-9]+/)
+      .filter((term) => term.length >= 3 && !RELATED_STOP_WORDS.has(term))
+      .map((term) =>
+        term.length > 6
+          ? term.replace(
+              /(coes|cao|mente|amentos|amento|idades|idade|ados|adas|idos|idas|ar|er|ir|s)$/,
+              "",
+            )
+          : term,
+      )
+      .filter((term) => term.length >= 3),
+  );
+}
+
+function relatedIssueScore(
+  title: string,
+  description: string,
+  selectedLabels: string[],
+  issue: IssueRecord,
+) {
+  const sourceTitle = relatedTerms(title);
+  const sourceDescription = relatedTerms(description);
+  const candidateTitle = relatedTerms(issue.title);
+  const candidateDescription = relatedTerms(issue.description ?? "");
+  const matched = new Set<string>();
+  let score = 0;
+  candidateTitle.forEach((term) => {
+    if (sourceTitle.has(term)) {
+      score += 5;
+      matched.add(term);
+    } else if (sourceDescription.has(term)) {
+      score += 3;
+      matched.add(term);
+    }
+  });
+  candidateDescription.forEach((term) => {
+    if (sourceTitle.has(term)) {
+      score += 2;
+      matched.add(term);
+    } else if (sourceDescription.has(term)) {
+      score += 1;
+      matched.add(term);
+    }
+  });
+  issue.labels.forEach((item) => {
+    if (selectedLabels.includes(item.name)) score += 3;
+  });
+  return { score, matches: [...matched].slice(0, 4) };
+}
+
 const nav: { id: View; label: string; icon: string }[] = [
   { id: "today", label: "Hoje", icon: "⌂" },
+  { id: "issues", label: "Explorar US", icon: "☷" },
+  { id: "team", label: "Alocação da equipa", icon: "▦" },
   { id: "timeline", label: "Timeline", icon: "↔" },
   { id: "completed", label: "Trabalho realizado", icon: "✓" },
   { id: "analytics", label: "Analytics", icon: "⌁" },
@@ -520,6 +652,15 @@ function readStorage<T>(key: string, fallback: T): T {
     return JSON.parse(saved) as T;
   } catch {
     return fallback;
+  }
+}
+
+function writeStorage(key: string, value: unknown) {
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value));
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -611,6 +752,10 @@ export default function WorkOrganizer({
   const [labelCatalog, setLabelCatalog] = useState<
     Record<string, GitLabLabel[]>
   >({});
+  const [teamMembers, setTeamMembers] = useState<TeamMember[]>(
+    DEFAULT_TEAM_MEMBERS,
+  );
+  const [teamAllocations, setTeamAllocations] = useState<TeamAllocation[]>([]);
   const [showToken, setShowToken] = useState(false);
   const [settingsSection, setSettingsSection] =
     useState<SettingsSection>("gitlab");
@@ -634,6 +779,16 @@ export default function WorkOrganizer({
   const msalRef = useRef<PublicClientApplication | null>(null);
 
   useEffect(() => {
+    const requested = new URLSearchParams(window.location.search).get("view");
+    if (
+      requested &&
+      [...nav.map((item) => item.id), "settings"].includes(requested as View)
+    ) {
+      setView(requested as View);
+    }
+  }, []);
+
+  useEffect(() => {
     let cancelled = false;
     async function hydrateFromDatabase() {
       const localState: PersistedState = {
@@ -645,6 +800,11 @@ export default function WorkOrganizer({
         capacity: readCapacity(),
         projectPreferences: readStorage("work-organizer.projects", []),
         labelCatalog: readStorage("work-organizer.labels", {}),
+        teamMembers: readStorage(
+          "work-organizer.team-members",
+          DEFAULT_TEAM_MEMBERS,
+        ),
+        teamAllocations: readStorage("work-organizer.team-allocations", []),
       };
       setConfig(readStorage("work-organizer.gitlab", DEFAULT_GITLAB_CONFIG));
       setOutlookConfig(
@@ -677,6 +837,10 @@ export default function WorkOrganizer({
             typeof data.state.labelCatalog === "object"
           )
             setLabelCatalog(data.state.labelCatalog);
+          if (Array.isArray(data.state.teamMembers))
+            setTeamMembers(data.state.teamMembers);
+          if (Array.isArray(data.state.teamAllocations))
+            setTeamAllocations(data.state.teamAllocations);
         } else {
           if (!cancelled) {
             setTasks(localState.tasks);
@@ -686,6 +850,8 @@ export default function WorkOrganizer({
             setCapacity(localState.capacity);
             setProjectPreferences(localState.projectPreferences);
             setLabelCatalog(localState.labelCatalog);
+            setTeamMembers(localState.teamMembers);
+            setTeamAllocations(localState.teamAllocations);
           }
           const migration = await fetch("/api/state", {
             method: "PUT",
@@ -708,6 +874,8 @@ export default function WorkOrganizer({
           setCapacity(localState.capacity);
           setProjectPreferences(localState.projectPreferences);
           setLabelCatalog(localState.labelCatalog);
+          setTeamMembers(localState.teamMembers);
+          setTeamAllocations(localState.teamAllocations);
           setPersistenceStatus("local");
           setToast(
             `${error instanceof Error ? error.message : "A base de dados não está disponível."} Os dados continuam guardados neste browser.`,
@@ -722,25 +890,22 @@ export default function WorkOrganizer({
   }, []);
   useEffect(() => {
     if (persistenceStatus === "loading") return;
-    window.localStorage.setItem("work-organizer.tasks", JSON.stringify(tasks));
-    window.localStorage.setItem("work-organizer.issues", JSON.stringify(issues));
-    window.localStorage.setItem("work-organizer.logs", JSON.stringify(logs));
-    window.localStorage.setItem(
-      "work-organizer.meetings",
-      JSON.stringify(meetings),
-    );
-    window.localStorage.setItem(
-      "work-organizer.capacity",
-      JSON.stringify(capacity),
-    );
-    window.localStorage.setItem(
-      "work-organizer.projects",
-      JSON.stringify(projectPreferences),
-    );
-    window.localStorage.setItem(
-      "work-organizer.labels",
-      JSON.stringify(labelCatalog),
-    );
+    const localCacheFailed = [
+      writeStorage("work-organizer.tasks", tasks),
+      writeStorage("work-organizer.issues", issues),
+      writeStorage("work-organizer.logs", logs),
+      writeStorage("work-organizer.meetings", meetings),
+      writeStorage("work-organizer.capacity", capacity),
+      writeStorage("work-organizer.projects", projectPreferences),
+      writeStorage("work-organizer.labels", labelCatalog),
+      writeStorage("work-organizer.team-members", teamMembers),
+      writeStorage("work-organizer.team-allocations", teamAllocations),
+    ].some((saved) => !saved);
+    if (localCacheFailed) {
+      setToast(
+        "O cache deste browser ficou sem espaço. Os dados continuam a ser guardados na base de dados.",
+      );
+    }
     const controller = new AbortController();
     const timer = window.setTimeout(async () => {
       try {
@@ -753,6 +918,8 @@ export default function WorkOrganizer({
           capacity,
           projectPreferences,
           labelCatalog,
+          teamMembers,
+          teamAllocations,
         };
         const response = await fetch("/api/state", {
           method: "PUT",
@@ -789,6 +956,8 @@ export default function WorkOrganizer({
     capacity,
     projectPreferences,
     labelCatalog,
+    teamMembers,
+    teamAllocations,
     persistenceStatus,
   ]);
   useEffect(() => {
@@ -805,19 +974,9 @@ export default function WorkOrganizer({
     return () => window.clearTimeout(timer);
   }, [toast]);
 
-  const issueStateById = useMemo(
-    () => new Map(issues.map((issue) => [issue.id, issue.state])),
-    [issues],
-  );
-  const planningTasks = useMemo(
-    () =>
-      tasks.filter(
-        (task) =>
-          task.source === "outlook" ||
-          issueStateById.get(task.rootId) !== "closed",
-      ),
-    [tasks, issueStateById],
-  );
+  // Closing a US finishes it in GitLab, but its allocation remains part of the
+  // planning history and must stay visible in the Timeline.
+  const planningTasks = tasks;
   const todayTasks = planningTasks.filter((task) => task.date === todayKey);
   const todayPlanned = todayTasks.reduce((sum, task) => sum + task.estimate, 0);
   const todaySpent = logs
@@ -1037,6 +1196,7 @@ export default function WorkOrganizer({
           projectId: issue.project_id,
           iid: issue.iid,
           title: issue.title,
+          description: issue.description ?? "",
           client: preference?.client ?? projectClient(project),
           project:
             preference?.project ??
@@ -1048,8 +1208,10 @@ export default function WorkOrganizer({
           teamSpent: (issue.time_stats?.total_time_spent ?? 0) / 3600,
           personalSpent: personalSpentByIssue.get(id) ?? 0,
           assigneeCount: issue.assignees?.length ?? 0,
+          assignees: assigneesForIssue(issue),
           due: issue.due_date ? formatDate(issue.due_date) : "Sem prazo",
           dueDate: issue.due_date,
+          closedAt: issue.closed_at,
           type: taskType(issue.labels),
           priority: taskPriority(issue.labels),
           webUrl: issue.web_url,
@@ -1107,6 +1269,8 @@ export default function WorkOrganizer({
                 webUrl: issue.webUrl,
                 hasEstimate: issue.hasEstimate,
                 labels: issue.labels,
+                assignees: issue.assignees,
+                closedAt: issue.closedAt,
               }
             : task;
         }),
@@ -1154,6 +1318,206 @@ export default function WorkOrganizer({
       .sort((a, b) => a.name.localeCompare(b.name));
     setLabelCatalog((current) => ({ ...current, [String(projectId)]: labels }));
     return labels;
+  }
+
+  async function updateIssueState(
+    issue: IssueRecord,
+    state: "opened" | "closed",
+  ) {
+    if (issue.state === state) return issue;
+    if (!config.token)
+      throw new Error("Configura primeiro a ligação ao GitLab.");
+    const data = await callGitLab("updateIssueState", {
+      projectId: issue.projectId,
+      issueIid: issue.iid,
+      state,
+    });
+    const remote = data.issue as GitLabIssue;
+    setIssues((current) =>
+      current.map((item) =>
+        item.id === issue.id
+          ? {
+              ...item,
+              state: remote.state,
+              closedAt: remote.closed_at,
+            }
+          : item,
+      ),
+    );
+    setTasks((current) =>
+      current.map((task) =>
+        task.rootId === issue.id
+          ? { ...task, closedAt: remote.closed_at }
+          : task,
+      ),
+    );
+    return { ...issue, state: remote.state, closedAt: remote.closed_at };
+  }
+
+  async function moveIssueProject(issue: IssueRecord, toProjectId: number) {
+    if (issue.projectId === toProjectId) return issue;
+    if (!config.token)
+      throw new Error("Configura primeiro a ligação ao GitLab.");
+    const destination = projectPreferences.find(
+      (project) => project.projectId === toProjectId,
+    );
+    if (!destination) throw new Error("O projeto de destino já não está disponível.");
+    const data = await callGitLab("moveIssue", {
+      projectId: issue.projectId,
+      issueIid: issue.iid,
+      toProjectId,
+    });
+    const remote = data.issue as GitLabIssue;
+    const nextId = `gitlab-${remote.project_id}-${remote.iid}`;
+    const moved: IssueRecord = {
+      ...issue,
+      id: nextId,
+      projectId: remote.project_id,
+      iid: remote.iid,
+      title: remote.title,
+      description: remote.description ?? issue.description ?? "",
+      client: destination.client,
+      project: destination.project,
+      color: destination.color,
+      state: remote.state,
+      webUrl: remote.web_url,
+      due: remote.due_date ? formatDate(remote.due_date) : "Sem prazo",
+      dueDate: remote.due_date,
+      closedAt: remote.closed_at,
+      labels: labelsForIssue(
+        remote.labels,
+        labelCatalog[String(remote.project_id)] ?? [],
+      ),
+      assignees: assigneesForIssue(remote),
+      assigneeCount: remote.assignees?.length ?? 0,
+    };
+    setIssues((current) =>
+      current.map((item) => (item.id === issue.id ? moved : item)),
+    );
+    setTasks((current) =>
+      current.map((task) =>
+        task.rootId === issue.id
+          ? {
+              ...task,
+              rootId: nextId,
+              projectId: moved.projectId,
+              iid: moved.iid,
+              title: moved.title,
+              client: moved.client,
+              project: moved.project,
+              color: moved.color,
+              webUrl: moved.webUrl,
+              due: moved.due,
+              dueDate: moved.dueDate,
+              closedAt: moved.closedAt,
+              labels: moved.labels,
+              assignees: moved.assignees,
+            }
+          : task,
+      ),
+    );
+    setLogs((current) =>
+      current.map((log) =>
+        log.projectId === issue.projectId && log.issueIid === issue.iid
+          ? {
+              ...log,
+              projectId: moved.projectId,
+              issueIid: moved.iid,
+              client: moved.client,
+              project: moved.project,
+              webUrl: moved.webUrl,
+            }
+          : log,
+      ),
+    );
+    setMeetings((current) =>
+      current.map((meeting) =>
+        meeting.linkedIssueId === issue.id
+          ? {
+              ...meeting,
+              projectId: moved.projectId,
+              linkedIssueId: nextId,
+              linkedIssueIid: moved.iid,
+              linkedIssueWebUrl: moved.webUrl,
+            }
+          : meeting,
+      ),
+    );
+    return moved;
+  }
+
+  async function updateIssueLabels(issue: IssueRecord, labelNames: string[]) {
+    const currentNames = issue.labels.map((label) => label.name).sort();
+    const nextNames = [...new Set(labelNames)].sort();
+    if (
+      currentNames.length === nextNames.length &&
+      currentNames.every((name, index) => name === nextNames[index])
+    )
+      return issue;
+    if (!config.token)
+      throw new Error("Configura primeiro a ligação ao GitLab.");
+    const data = await callGitLab("updateIssueLabels", {
+      projectId: issue.projectId,
+      issueIid: issue.iid,
+      labels: nextNames,
+    });
+    const remote = data.issue as GitLabIssue;
+    const labels = labelsForIssue(
+      remote.labels,
+      labelCatalog[String(issue.projectId)] ?? [],
+    );
+    const updated = {
+      ...issue,
+      labels,
+      type: taskType(remote.labels),
+      priority: taskPriority(remote.labels),
+    };
+    setIssues((current) =>
+      current.map((item) => (item.id === issue.id ? updated : item)),
+    );
+    setTasks((current) =>
+      current.map((task) =>
+        task.rootId === issue.id
+          ? {
+              ...task,
+              labels,
+              type: updated.type,
+              priority: updated.priority,
+            }
+          : task,
+      ),
+    );
+    return updated;
+  }
+
+  async function updateIssueDescription(
+    issue: IssueRecord,
+    description: string,
+  ) {
+    if ((issue.description ?? "") === description) return issue;
+    if (!config.token)
+      throw new Error("Configura primeiro a ligação ao GitLab.");
+    const data = await callGitLab("updateIssueDescription", {
+      projectId: issue.projectId,
+      issueIid: issue.iid,
+      description,
+    });
+    const remote = data.issue as GitLabIssue;
+    const updated = {
+      ...issue,
+      description: remote.description ?? description,
+    };
+    setIssues((current) =>
+      current.map((item) => (item.id === issue.id ? updated : item)),
+    );
+    return updated;
+  }
+
+  async function renderGitLabMarkdown(markdown: string, projectId?: number) {
+    if (!config.token)
+      throw new Error("Configura primeiro a ligação ao GitLab.");
+    const data = await callGitLab("renderMarkdown", { markdown, projectId });
+    return String(data.html ?? "");
   }
 
   async function getMsal() {
@@ -1205,7 +1569,11 @@ export default function WorkOrganizer({
     }
   }
 
-  function replaceImportedMeetings(events: CalendarMeeting[]) {
+  function mergeImportedMeetings(
+    events: CalendarMeeting[],
+    importStartKey: string,
+    importEndKey: string,
+  ) {
     const previous = new Map(meetings.map((meeting) => [meeting.id, meeting]));
     const imported = events.map((event) => {
       const saved = previous.get(event.id);
@@ -1219,22 +1587,6 @@ export default function WorkOrganizer({
     });
     const importedRootIds = new Set(
       imported.map((meeting) => `outlook-${meeting.id}`),
-    );
-    const importedMeetingIds = new Set(
-      imported.map((meeting) => meeting.id),
-    );
-    const importEnd = addDays(todayKey, 36);
-    const isInImportWindow = (value: string) =>
-      value >= todayKey && value < importEnd;
-    const removedLinkedIssueIds = new Set(
-      meetings
-        .filter(
-          (meeting) =>
-            isInImportWindow(meeting.start.slice(0, 10)) &&
-            !importedMeetingIds.has(meeting.id) &&
-            meeting.linkedIssueId,
-        )
-        .map((meeting) => meeting.linkedIssueId!),
     );
     const meetingTasks = imported.flatMap((meeting): Task[] => {
       if (meeting.linkedIssueId) return [];
@@ -1272,17 +1624,22 @@ export default function WorkOrganizer({
         },
       ];
     });
-    setMeetings(imported);
+    const isInImportRange = (date: string) =>
+      date >= importStartKey && date < importEndKey;
+    // This is a complete calendar slice. Any saved Outlook meeting inside the
+    // same range but absent from the response was cancelled or is no longer
+    // accepted, so it must disappear from the calendar as well.
+    const merged = [
+      ...meetings.filter(
+        (meeting) => !isInImportRange(meeting.start.slice(0, 10)),
+      ),
+      ...imported,
+    ].sort((left, right) => left.start.localeCompare(right.start));
+    setMeetings(merged);
     setTasks((current) => [
       ...current.filter((task) => {
         if (importedRootIds.has(task.rootId)) return false;
-        if (task.source === "outlook" && isInImportWindow(task.date))
-          return false;
-        if (
-          removedLinkedIssueIds.has(task.rootId) &&
-          task.fixed &&
-          task.phase === "Reunião"
-        )
+        if (task.source === "outlook" && isInImportRange(task.date))
           return false;
         return true;
       }),
@@ -1313,12 +1670,11 @@ export default function WorkOrganizer({
               }),
             )
         : await msal.loginPopup({ scopes: ["User.Read", "Calendars.Read"] });
-      const start = new Date();
-      const end = new Date();
-      end.setDate(end.getDate() + 35);
+      const importStartKey = `${todayKey.slice(0, 8)}01`;
+      const importEndKey = addDays(todayKey, 36);
       const params = new URLSearchParams({
-        startDateTime: start.toISOString(),
-        endDateTime: end.toISOString(),
+        startDateTime: `${importStartKey}T00:00:00Z`,
+        endDateTime: `${importEndKey}T00:00:00Z`,
         $orderby: "start/dateTime",
         $top: "200",
         $select:
@@ -1364,7 +1720,11 @@ export default function WorkOrganizer({
           webUrl: event.webLink,
           joinUrl: event.onlineMeeting?.joinUrl,
         }));
-      const imported = replaceImportedMeetings(events);
+      const imported = mergeImportedMeetings(
+        events,
+        importStartKey,
+        importEndKey,
+      );
       setOutlookConnection({
         state: "ok",
         message: `${imported.length} reuniões importadas para os próximos 35 dias.`,
@@ -1396,7 +1756,13 @@ export default function WorkOrganizer({
       message: "A ler o Outlook clássico instalado…",
     });
     try {
-      const response = await fetch("http://127.0.0.1:47831/calendar?days=35", {
+      const importStartKey = `${todayKey.slice(0, 8)}01`;
+      const importEndKey = addDays(todayKey, 36);
+      const importDays = Math.round(
+        (fromKey(importEndKey).getTime() - fromKey(importStartKey).getTime()) /
+          86_400_000,
+      );
+      const response = await fetch(`http://127.0.0.1:47831/calendar?start=${importStartKey}&days=${importDays}`, {
         signal: AbortSignal.timeout(30000),
       });
       const data = await response.json();
@@ -1404,7 +1770,11 @@ export default function WorkOrganizer({
         throw new Error(
           data.error ?? "A ponte local do Outlook devolveu um erro.",
         );
-      const imported = replaceImportedMeetings(data.events ?? []);
+      const imported = mergeImportedMeetings(
+        data.events ?? [],
+        importStartKey,
+        importEndKey,
+      );
       setOutlookConnection({
         state: "ok",
         message: `${imported.length} reuniões lidas do Outlook clássico.`,
@@ -1509,6 +1879,8 @@ export default function WorkOrganizer({
         source: "gitlab",
         hasEstimate: issue.hasEstimate,
         labels: issue.labels,
+        assignees: issue.assignees,
+        closedAt: issue.closedAt,
       };
       if (draft.distribution === "manual") {
         return [
@@ -1562,8 +1934,9 @@ export default function WorkOrganizer({
     );
   }
 
-  function saveAllocation(draft: AllocationDraft) {
-    const issue = issues.find((item) => item.id === draft.issueId);
+  function saveAllocation(draft: AllocationDraft, issueOverride?: IssueRecord) {
+    const issue =
+      issueOverride ?? issues.find((item) => item.id === draft.issueId);
     if (!issue) {
       notify("A US já não está disponível. Sincroniza novamente o GitLab.");
       return;
@@ -1586,9 +1959,19 @@ export default function WorkOrganizer({
       description: draft.description,
       estimateHours: draft.estimateHours,
       labels: draft.labels,
+      relatedIssues: draft.relatedIssueIds.flatMap((id) => {
+        const related = issues.find((issue) => issue.id === id);
+        return related
+          ? [{ projectId: related.projectId, issueIid: related.iid }]
+          : [];
+      }),
     });
     const remote = data.issue as GitLabIssue;
     const remoteProject = data.project as GitLabProject;
+    const failedRelatedIssues = Number(data.failedRelatedIssues ?? 0);
+    const relationSuffix = failedRelatedIssues
+      ? ` ${failedRelatedIssues} relação(ões) não puderam ser criada(s) no GitLab.`
+      : "";
     const preference = projectPreferences.find(
       (project) => project.projectId === draft.projectId,
     );
@@ -1600,6 +1983,7 @@ export default function WorkOrganizer({
       projectId: remote.project_id,
       iid: remote.iid,
       title: remote.title,
+      description: remote.description ?? draft.description,
       client: preference?.client ?? projectClient(remoteProject),
       project:
         preference?.project ??
@@ -1611,8 +1995,10 @@ export default function WorkOrganizer({
       teamSpent: (remote.time_stats?.total_time_spent ?? 0) / 3600,
       personalSpent: 0,
       assigneeCount: remote.assignees?.length ?? 1,
+      assignees: assigneesForIssue(remote),
       due: remote.due_date ? formatDate(remote.due_date) : "Sem prazo",
       dueDate: remote.due_date,
+      closedAt: remote.closed_at,
       type: taskType(remote.labels),
       priority: taskPriority(remote.labels),
       webUrl: remote.web_url,
@@ -1664,12 +2050,14 @@ export default function WorkOrganizer({
                 source: "gitlab",
                 hasEstimate: issue.hasEstimate,
                 labels: issue.labels,
+                assignees: issue.assignees,
+                closedAt: issue.closedAt,
               }
             : task,
         ),
       );
       notify(
-        `US #${issue.iid} criada para a reunião. O cronómetro passa a registar spent no GitLab.`,
+        `US #${issue.iid} criada para a reunião. O cronómetro passa a registar spent no GitLab.${relationSuffix}`,
       );
     } else {
       saveAllocationForIssue(issue, {
@@ -1681,7 +2069,9 @@ export default function WorkOrganizer({
         distribution: draft.distribution,
         description: draft.description,
       });
-      notify(`Tarefa #${issue.iid} criada no GitLab e adicionada à Timeline.`);
+      notify(
+        `Tarefa #${issue.iid} criada no GitLab e adicionada à Timeline.${relationSuffix}`,
+      );
     }
   }
 
@@ -1902,7 +2292,11 @@ export default function WorkOrganizer({
             <strong>
               {view === "today"
                 ? "Hoje"
-                : view === "timeline"
+                : view === "issues"
+                  ? "Explorar US"
+                  : view === "team"
+                    ? "Alocação da equipa"
+                    : view === "timeline"
                   ? "Timeline"
                   : view === "completed"
                     ? "Trabalho realizado"
@@ -2131,6 +2525,11 @@ export default function WorkOrganizer({
             setDragged={setDragged}
             moveTask={moveTask}
             saveAllocation={saveAllocation}
+            updateIssueState={updateIssueState}
+            moveIssueProject={moveIssueProject}
+            updateIssueLabels={updateIssueLabels}
+            updateIssueDescription={updateIssueDescription}
+            renderMarkdown={renderGitLabMarkdown}
             createIssueAndAllocate={createIssueAndAllocate}
             deleteAllocation={deleteAllocation}
             autoPlan={autoPlan}
@@ -2138,8 +2537,20 @@ export default function WorkOrganizer({
             capacity={capacity}
           />
         )}
+        {view === "issues" && <IssuesView issues={issues} tasks={tasks} />}
+        {view === "team" && (
+          <TeamAllocationView
+            issues={issues}
+            members={teamMembers}
+            allocations={teamAllocations}
+            setMembers={setTeamMembers}
+            setAllocations={setTeamAllocations}
+            todayKey={todayKey}
+            setToast={setToast}
+          />
+        )}
         {view === "completed" && (
-          <CompletedView logs={logs} todayKey={todayKey} />
+          <CompletedView tasks={tasks} todayKey={todayKey} />
         )}
         {view === "analytics" && (
           <AnalyticsView
@@ -2272,6 +2683,133 @@ function IssueLabels({
           {label.name}
         </span>
       ))}
+    </div>
+  );
+}
+
+function MarkdownEditor({
+  value,
+  onChange,
+  renderMarkdown,
+  rows = 7,
+  placeholder,
+  autoFocus = false,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  renderMarkdown: (markdown: string, projectId?: number) => Promise<string>;
+  rows?: number;
+  placeholder?: string;
+  autoFocus?: boolean;
+}) {
+  const [mode, setMode] = useState<"write" | "preview">("write");
+  const [preview, setPreview] = useState("");
+  const [previewSource, setPreviewSource] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  async function showPreview() {
+    setMode("preview");
+    if (value === previewSource && !error) return;
+    setLoading(true);
+    setError("");
+    try {
+      setPreview(await renderMarkdown(value));
+      setPreviewSource(value);
+    } catch (previewError) {
+      setError(
+        previewError instanceof Error
+          ? previewError.message
+          : "Não foi possível gerar a pré-visualização.",
+      );
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="markdown-editor">
+      <div className="markdown-editor-tabs">
+        <button
+          type="button"
+          className={mode === "write" ? "active" : ""}
+          onClick={() => setMode("write")}
+        >
+          Escrever
+        </button>
+        <button
+          type="button"
+          className={mode === "preview" ? "active" : ""}
+          onClick={() => void showPreview()}
+        >
+          Pré-visualizar
+        </button>
+        <span>Markdown do GitLab</span>
+      </div>
+      {mode === "write" ? (
+        <textarea
+          autoFocus={autoFocus}
+          rows={rows}
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          placeholder={placeholder}
+        />
+      ) : (
+        <div className="markdown-preview">
+          {loading ? (
+            <p className="markdown-preview-state">A gerar pré-visualização…</p>
+          ) : error ? (
+            <p className="markdown-preview-error">{error}</p>
+          ) : preview ? (
+            <div dangerouslySetInnerHTML={{ __html: preview }} />
+          ) : (
+            <p className="markdown-preview-state">Sem conteúdo para apresentar.</p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function IssueAssignees({
+  assignees,
+  compact = false,
+}: {
+  assignees?: GitLabAssignee[];
+  compact?: boolean;
+}) {
+  if (!assignees?.length) {
+    return compact ? null : (
+      <div className="issue-assignees unassigned">Sem responsável</div>
+    );
+  }
+  return (
+    <div className={`issue-assignees ${compact ? "compact" : ""}`}>
+      {assignees.map((assignee) => {
+        const label = assignee.name?.trim() || assignee.username || "Utilizador";
+        const initials = label
+          .split(/\s+/)
+          .slice(0, 2)
+          .map((part) => part[0])
+          .join("")
+          .toUpperCase();
+        return (
+          <span className="issue-assignee" key={assignee.id} title={label}>
+            <i
+              aria-hidden="true"
+              className={assignee.avatarUrl ? "has-avatar" : ""}
+              style={
+                assignee.avatarUrl
+                  ? { backgroundImage: `url("${assignee.avatarUrl.replace(/"/g, "%22")}")` }
+                  : undefined
+              }
+            >
+              {!assignee.avatarUrl && initials}
+            </i>
+            <b>{label}</b>
+          </span>
+        );
+      })}
     </div>
   );
 }
@@ -2419,6 +2957,7 @@ function TodayView({
                         </div>
                         <IssueTitle task={task} />
                         <IssueLabels labels={task.labels} compact />
+                        <IssueAssignees assignees={task.assignees} compact />
                         <p>
                           {task.description
                             ? `${task.description} · ${task.phase}`
@@ -2674,6 +3213,11 @@ function TimelineView({
   setDragged,
   moveTask,
   saveAllocation,
+  updateIssueState,
+  moveIssueProject,
+  updateIssueLabels,
+  updateIssueDescription,
+  renderMarkdown,
   createIssueAndAllocate,
   deleteAllocation,
   autoPlan,
@@ -2688,7 +3232,24 @@ function TimelineView({
   dragged: string | null;
   setDragged: (id: string | null) => void;
   moveTask: (id: string, date: string, start?: number) => void;
-  saveAllocation: (draft: AllocationDraft) => void;
+  saveAllocation: (draft: AllocationDraft, issueOverride?: IssueRecord) => void;
+  updateIssueState: (
+    issue: IssueRecord,
+    state: "opened" | "closed",
+  ) => Promise<IssueRecord>;
+  moveIssueProject: (
+    issue: IssueRecord,
+    toProjectId: number,
+  ) => Promise<IssueRecord>;
+  updateIssueLabels: (
+    issue: IssueRecord,
+    labels: string[],
+  ) => Promise<IssueRecord>;
+  updateIssueDescription: (
+    issue: IssueRecord,
+    description: string,
+  ) => Promise<IssueRecord>;
+  renderMarkdown: (markdown: string, projectId?: number) => Promise<string>;
   createIssueAndAllocate: (draft: CreateIssueDraft) => Promise<void>;
   deleteAllocation: (id: string) => void;
   autoPlan: () => void;
@@ -2700,7 +3261,10 @@ function TimelineView({
   const [backlogSearch, setBacklogSearch] = useState("");
   const [backlogFilter, setBacklogFilter] = useState<
     "all" | "unplanned" | "planned"
-  >("unplanned");
+  >("all");
+  const [assigneeFilter, setAssigneeFilter] = useState("all");
+  const [hiddenProjectIds, setHiddenProjectIds] = useState<number[]>([]);
+  const [hiddenLabels, setHiddenLabels] = useState<string[]>([]);
   const [editor, setEditor] = useState<AllocationDraft | null>(null);
   const [createEditor, setCreateEditor] = useState<CreateIssueDraft | null>(
     null,
@@ -2708,8 +3272,18 @@ function TimelineView({
   const [creatingIssue, setCreatingIssue] = useState(false);
   const [labelsLoading, setLabelsLoading] = useState(false);
   const [createError, setCreateError] = useState("");
+  const [editorError, setEditorError] = useState("");
+  const [savingEditor, setSavingEditor] = useState(false);
+  const [projectSearch, setProjectSearch] = useState("");
+  const [editorProjectSearch, setEditorProjectSearch] = useState("");
+  const [editorLabelsLoading, setEditorLabelsLoading] = useState(false);
   const days = visibleDaysFor(anchor, zoom, capacity.workDays);
   const openedIssues = issues.filter((issue) => issue.state === "opened");
+  const closedIssueIds = new Set(
+    issues
+      .filter((issue) => issue.state === "closed")
+      .map((issue) => issue.id),
+  );
   const visibleDaySet = new Set(days);
   const visibleTasks = tasks.filter((task) => visibleDaySet.has(task.date));
   const visibleProjects = uniqueBy(
@@ -2737,14 +3311,144 @@ function TimelineView({
     return values;
   }, [tasks]);
   const needle = backlogSearch.trim().toLowerCase();
+  const assigneeOptions = useMemo(() => {
+    const byId = new Map<number, GitLabAssignee>();
+    issues
+      .filter((issue) => issue.state === "opened")
+      .forEach((issue) =>
+        (issue.assignees ?? []).forEach((assignee) =>
+          byId.set(assignee.id, assignee),
+        ),
+      );
+    return [...byId.values()].sort((left, right) =>
+      (left.name || left.username || "").localeCompare(
+        right.name || right.username || "",
+      ),
+    );
+  }, [issues]);
+  useEffect(() => {
+    if (
+      assigneeFilter !== "all" &&
+      assigneeFilter !== "unassigned" &&
+      !assigneeOptions.some(
+        (assignee) => String(assignee.id) === assigneeFilter,
+      )
+    ) {
+      setAssigneeFilter("all");
+    }
+  }, [assigneeFilter, assigneeOptions]);
+  const backlogProjectOptions = useMemo(
+    () =>
+      uniqueBy(
+        issues.filter((issue) => issue.state === "opened"),
+        (issue) => String(issue.projectId),
+      ).sort(
+        (left, right) =>
+          left.client.localeCompare(right.client) ||
+          left.project.localeCompare(right.project),
+      ),
+    [issues],
+  );
+  const backlogLabelOptions = useMemo(() => {
+    const byName = new Map<string, GitLabLabel>();
+    issues
+      .filter((issue) => issue.state === "opened")
+      .forEach((issue) =>
+        (issue.labels ?? []).forEach((label) => byName.set(label.name, label)),
+      );
+    return [...byName.values()].sort((left, right) =>
+      left.name.localeCompare(right.name),
+    );
+  }, [issues]);
+  const projectSearchNeedle = projectSearch.trim().toLowerCase();
+  const selectableProjects = gitlabProjects
+    .filter((project) => project.projectId > 0)
+    .sort(
+      (left, right) =>
+        left.client.localeCompare(right.client) ||
+        left.project.localeCompare(right.project),
+    );
+  const matchingProjects = projectSearchNeedle
+    ? selectableProjects
+        .filter((project) =>
+          `${project.client} ${project.project} ${project.projectId}`
+            .toLowerCase()
+            .includes(projectSearchNeedle),
+        )
+        .slice(0, 50)
+    : [];
+  const editorProjectNeedle = editorProjectSearch.trim().toLowerCase();
+  const matchingEditorProjects = editorProjectNeedle
+    ? selectableProjects
+        .filter((project) =>
+          `${project.client} ${project.project} ${project.projectId}`
+            .toLowerCase()
+            .includes(editorProjectNeedle),
+        )
+        .slice(0, 50)
+    : [];
+  const selectedEditorProject = editor
+    ? selectableProjects.find(
+        (project) => project.projectId === editor.projectId,
+      )
+    : undefined;
+  const selectedCreateProject = createEditor
+    ? selectableProjects.find(
+        (project) => project.projectId === createEditor.projectId,
+      )
+    : undefined;
+  const relatedSuggestions = useMemo(() => {
+    if (!createEditor) return [];
+    const hasEnoughText =
+      relatedTerms(`${createEditor.title} ${createEditor.description}`).size > 0;
+    if (!hasEnoughText) return [];
+    return issues
+      .map((issue) => ({
+        issue,
+        ...relatedIssueScore(
+          createEditor.title,
+          createEditor.description,
+          createEditor.labels,
+          issue,
+        ),
+      }))
+      .filter((item) => item.score >= 2)
+      .sort(
+        (left, right) =>
+          right.score - left.score ||
+          Number(right.issue.state === "opened") -
+            Number(left.issue.state === "opened"),
+      )
+      .slice(0, 6);
+  }, [createEditor, issues]);
+  const selectedRelatedIssues = createEditor
+    ? createEditor.relatedIssueIds
+        .map((id) => issues.find((issue) => issue.id === id))
+        .filter((issue): issue is IssueRecord => Boolean(issue))
+    : [];
   const backlog = openedIssues
     .filter((issue) => {
       const planned = plannedByIssue.get(issue.id) ?? 0;
       if (backlogFilter === "unplanned" && planned > 0) return false;
       if (backlogFilter === "planned" && planned <= 0) return false;
+      if (hiddenProjectIds.includes(issue.projectId)) return false;
+      if (
+        issue.labels?.some((label) => hiddenLabels.includes(label.name))
+      )
+        return false;
+      if (assigneeFilter === "unassigned" && issue.assignees?.length)
+        return false;
+      if (
+        assigneeFilter !== "all" &&
+        assigneeFilter !== "unassigned" &&
+        !issue.assignees?.some(
+          (assignee) => String(assignee.id) === assigneeFilter,
+        )
+      )
+        return false;
       return (
         !needle ||
-        `${issue.title} ${issue.client} ${issue.project} ${issue.iid} ${(issue.labels ?? []).map((label) => label.name).join(" ")}`
+        `${issue.title} ${issue.client} ${issue.project} ${issue.iid} ${(issue.labels ?? []).map((label) => label.name).join(" ")} ${(issue.assignees ?? []).map((assignee) => `${assignee.name ?? ""} ${assignee.username ?? ""}`).join(" ")}`
           .toLowerCase()
           .includes(needle)
       );
@@ -2760,6 +3464,7 @@ function TimelineView({
     date = todayKey,
     start = capacity.startHour,
   ) {
+    setEditorError("");
     const alreadyPlanned = plannedByIssue.get(issue.id) ?? 0;
     const suggestion =
       issue.estimateTotal > 0
@@ -2777,6 +3482,7 @@ function TimelineView({
   }
 
   function openEdit(allocationId: string) {
+    setEditorError("");
     const segments = tasks
       .filter((task) => task.allocationId === allocationId)
       .sort((a, b) => a.date.localeCompare(b.date) || a.start - b.start);
@@ -2788,6 +3494,7 @@ function TimelineView({
         gitlabProjects.find((item) => item.projectId > 0);
       if (!project) return;
       setCreateError("");
+      setProjectSearch("");
       setCreateEditor({
         projectId: project.projectId,
         title: task.title,
@@ -2799,6 +3506,7 @@ function TimelineView({
         start: task.start,
         distribution: "manual",
         labels: [],
+        relatedIssueIds: [],
         meetingId: task.rootId.slice("outlook-".length),
       });
       refreshProjectLabels(project.projectId);
@@ -2806,7 +3514,18 @@ function TimelineView({
     }
     setEditor({
       issueId: segments[0].rootId,
+      projectId: segments[0].projectId,
+      labels:
+        issues
+          .find((issue) => issue.id === segments[0].rootId)
+          ?.labels.map((label) => label.name) ?? [],
+      issueDescription:
+        issues.find((issue) => issue.id === segments[0].rootId)?.description ??
+        "",
       allocationId,
+      issueState:
+        issues.find((issue) => issue.id === segments[0].rootId)?.state ??
+        "opened",
       phase: segments[0].phase,
       hours: segments.reduce((sum, task) => sum + task.estimate, 0),
       date: segments[0].date,
@@ -2814,6 +3533,45 @@ function TimelineView({
       distribution: segments.length > 1 ? "automatic" : "manual",
       description: segments[0].description ?? "",
     });
+    setEditorProjectSearch("");
+    refreshEditorProjectLabels(segments[0].projectId);
+  }
+
+  async function submitEditor() {
+    if (!editor || !editingIssue || !editor.description.trim()) return;
+    setSavingEditor(true);
+    try {
+      let savedIssue = editingIssue;
+      if (
+        editor.allocationId &&
+        editor.projectId &&
+        editor.projectId !== savedIssue.projectId
+      ) {
+        savedIssue = await moveIssueProject(savedIssue, editor.projectId);
+      }
+      if (editor.allocationId && editor.labels) {
+        savedIssue = await updateIssueLabels(savedIssue, editor.labels);
+      }
+      if (editor.allocationId && editor.issueDescription !== undefined) {
+        savedIssue = await updateIssueDescription(
+          savedIssue,
+          editor.issueDescription,
+        );
+      }
+      if (editor.allocationId && editor.issueState) {
+        savedIssue = await updateIssueState(savedIssue, editor.issueState);
+      }
+      saveAllocation({ ...editor, issueId: savedIssue.id }, savedIssue);
+      setEditor(null);
+    } catch (error) {
+      setEditorError(
+        error instanceof Error
+          ? error.message
+          : "Não foi possível atualizar a US no GitLab.",
+      );
+    } finally {
+      setSavingEditor(false);
+    }
   }
 
   function openCreateIssue(date = todayKey) {
@@ -2822,6 +3580,7 @@ function TimelineView({
     );
     if (!firstProject) return;
     setCreateError("");
+    setProjectSearch("");
     setCreateEditor({
       projectId: firstProject.projectId,
       title: "",
@@ -2833,6 +3592,7 @@ function TimelineView({
       start: capacity.startHour,
       distribution: "manual",
       labels: [],
+      relatedIssueIds: [],
     });
     refreshProjectLabels(firstProject.projectId);
   }
@@ -2851,6 +3611,31 @@ function TimelineView({
       .finally(() => setLabelsLoading(false));
   }
 
+  function refreshEditorProjectLabels(projectId: number) {
+    setEditorLabelsLoading(true);
+    setEditorError("");
+    void loadProjectLabels(projectId)
+      .catch((error) => {
+        setEditorError(
+          error instanceof Error
+            ? error.message
+            : "Não foi possível carregar as labels do projeto.",
+        );
+      })
+      .finally(() => setEditorLabelsLoading(false));
+  }
+
+  function toggleEditorLabel(name: string) {
+    if (!editor) return;
+    const labels = editor.labels ?? [];
+    setEditor({
+      ...editor,
+      labels: labels.includes(name)
+        ? labels.filter((label) => label !== name)
+        : [...labels, name],
+    });
+  }
+
   function toggleCreateLabel(name: string) {
     if (!createEditor) return;
     const selected = createEditor.labels.includes(name);
@@ -2859,6 +3644,17 @@ function TimelineView({
       labels: selected
         ? createEditor.labels.filter((label) => label !== name)
         : [...createEditor.labels, name],
+    });
+  }
+
+  function toggleRelatedIssue(issueId: string) {
+    if (!createEditor) return;
+    const selected = createEditor.relatedIssueIds.includes(issueId);
+    setCreateEditor({
+      ...createEditor,
+      relatedIssueIds: selected
+        ? createEditor.relatedIssueIds.filter((id) => id !== issueId)
+        : [...createEditor.relatedIssueIds, issueId],
     });
   }
 
@@ -2956,7 +3752,7 @@ function TimelineView({
               <span>BACKLOG</span>
               <strong>US abertas</strong>
             </div>
-            <b>{openedIssues.length}</b>
+            <b>{backlog.length}</b>
           </div>
           <div className="backlog-search">
             ⌕
@@ -2973,10 +3769,137 @@ function TimelineView({
               setBacklogFilter(event.target.value as typeof backlogFilter)
             }
           >
+            <option value="all">Todas as abertas</option>
             <option value="unplanned">Por planear</option>
             <option value="planned">Planeadas por mim</option>
-            <option value="all">Todas as abertas</option>
           </select>
+          <select
+            className="backlog-filter assignee-filter"
+            value={assigneeFilter}
+            onChange={(event) => setAssigneeFilter(event.target.value)}
+            aria-label="Filtrar US por responsável"
+          >
+            <option value="all">Todos os responsáveis</option>
+            <option value="unassigned">Sem responsável</option>
+            {assigneeOptions.map((assignee) => (
+              <option key={assignee.id} value={assignee.id}>
+                {assignee.name ||
+                  assignee.username ||
+                  `Utilizador ${assignee.id}`}
+              </option>
+            ))}
+          </select>
+          <div className="backlog-multi-filters">
+            <details className="backlog-multi-filter">
+              <summary>
+                <span>Projetos</span>
+                <b>
+                  {
+                    backlogProjectOptions.filter(
+                      (project) => !hiddenProjectIds.includes(project.projectId),
+                    ).length
+                  }
+                  /
+                  {backlogProjectOptions.length}
+                </b>
+              </summary>
+              <div className="backlog-filter-popover">
+                <div className="backlog-filter-actions">
+                  <button
+                    type="button"
+                    onClick={() => setHiddenProjectIds([])}
+                  >
+                    Mostrar todos
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setHiddenProjectIds(
+                        backlogProjectOptions.map((issue) => issue.projectId),
+                      )
+                    }
+                  >
+                    Ocultar todos
+                  </button>
+                </div>
+                <div className="backlog-filter-options">
+                  {backlogProjectOptions.map((project) => (
+                    <label key={project.projectId}>
+                      <input
+                        type="checkbox"
+                        checked={!hiddenProjectIds.includes(project.projectId)}
+                        onChange={() =>
+                          setHiddenProjectIds((current) =>
+                            current.includes(project.projectId)
+                              ? current.filter((id) => id !== project.projectId)
+                              : [...current, project.projectId],
+                          )
+                        }
+                      />
+                      <i style={{ backgroundColor: project.color }} />
+                      <span>
+                        <strong>{project.project}</strong>
+                        <small>{project.client}</small>
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            </details>
+            <details className="backlog-multi-filter">
+              <summary>
+                <span>Labels</span>
+                <b>
+                  {
+                    backlogLabelOptions.filter(
+                      (label) => !hiddenLabels.includes(label.name),
+                    ).length
+                  }
+                  /
+                  {backlogLabelOptions.length}
+                </b>
+              </summary>
+              <div className="backlog-filter-popover">
+                <div className="backlog-filter-actions">
+                  <button type="button" onClick={() => setHiddenLabels([])}>
+                    Mostrar todas
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setHiddenLabels(
+                        backlogLabelOptions.map((label) => label.name),
+                      )
+                    }
+                  >
+                    Ocultar todas
+                  </button>
+                </div>
+                <div className="backlog-filter-options">
+                  {backlogLabelOptions.map((label) => (
+                    <label key={label.name}>
+                      <input
+                        type="checkbox"
+                        checked={!hiddenLabels.includes(label.name)}
+                        onChange={() =>
+                          setHiddenLabels((current) =>
+                            current.includes(label.name)
+                              ? current.filter((name) => name !== label.name)
+                              : [...current, label.name],
+                          )
+                        }
+                      />
+                      <i style={{ backgroundColor: label.color }} />
+                      <span>
+                        <strong>{label.name}</strong>
+                      </span>
+                    </label>
+                  ))}
+                  {!backlogLabelOptions.length && <p>Sem labels disponíveis.</p>}
+                </div>
+              </div>
+            </details>
+          </div>
           <div className="backlog-list">
             {backlog.map((issue) => {
               const planned = plannedByIssue.get(issue.id) ?? 0;
@@ -3005,6 +3928,7 @@ function TimelineView({
                     {issue.client} · {issue.project}
                   </p>
                   <IssueLabels labels={issue.labels} />
+                  <IssueAssignees assignees={issue.assignees} />
                   <div className="backlog-hours">
                     <span>
                       <small>Estimate equipa</small>
@@ -3170,7 +4094,7 @@ function TimelineView({
                           return (
                             <article
                               key={task.id}
-                              className={`agenda-event ${task.fixed ? "fixed" : ""}`}
+                              className={`agenda-event ${task.fixed ? "fixed" : ""} ${closedIssueIds.has(task.rootId) ? "completed" : ""}`}
                               style={{
                                 borderColor: task.color,
                                 top: (start - agendaStart) * agendaHourHeight,
@@ -3305,7 +4229,7 @@ function TimelineView({
                       {bars.map((bar) => (
                         <article
                           key={bar.allocationId}
-                          className={`timeline-task timeline-span ${bar.task.fixed ? "fixed" : ""}`}
+                          className={`timeline-task timeline-span ${bar.task.fixed ? "fixed" : ""} ${closedIssueIds.has(bar.task.rootId) ? "completed" : ""}`}
                           style={{
                             borderColor: bar.task.color,
                             left: `calc(${bar.left}% + 4px)`,
@@ -3330,6 +4254,10 @@ function TimelineView({
                           </div>
                           <IssueTitle task={bar.task} compact />
                           <IssueLabels labels={bar.task.labels} compact />
+                          <IssueAssignees
+                            assignees={bar.task.assignees}
+                            compact
+                          />
                           <p>
                             {bar.task.description ||
                               (bar.task.due === "Reunião"
@@ -3437,6 +4365,7 @@ function TimelineView({
             </div>
             <div className="allocation-issue-labels">
               <IssueLabels labels={editingIssue.labels} />
+              <IssueAssignees assignees={editingIssue.assignees} />
             </div>
             <div className="allocation-context">
               <span>
@@ -3469,6 +4398,21 @@ function TimelineView({
               </div>
             )}
             <div className="allocation-form">
+              {editor.allocationId && (
+                <div className="allocation-description markdown-field">
+                  <span>Descrição da US no GitLab</span>
+                  <MarkdownEditor
+                    value={editor.issueDescription ?? ""}
+                    onChange={(issueDescription) =>
+                      setEditor({ ...editor, issueDescription })
+                    }
+                    renderMarkdown={(markdown) =>
+                      renderMarkdown(markdown, editor.projectId)
+                    }
+                    placeholder={"## Objetivo\n\nDescreve o contexto e os critérios de aceitação…"}
+                  />
+                </div>
+              )}
               <label className="allocation-description">
                 <span>O que vou fazer nesta alocação</span>
                 <textarea
@@ -3497,6 +4441,133 @@ function TimelineView({
                   ))}
                 </select>
               </label>
+              {editor.allocationId && (
+                <div className="allocation-description project-picker-field">
+                  <span>Projeto da US no GitLab</span>
+                  <div className="project-picker">
+                    <div className="project-picker-selected">
+                      <i style={{ backgroundColor: selectedEditorProject?.color }} />
+                      <span>
+                        {selectedEditorProject
+                          ? `${selectedEditorProject.client} · ${selectedEditorProject.project}`
+                          : "Escolhe um projeto"}
+                      </span>
+                      {selectedEditorProject && (
+                        <small>#{selectedEditorProject.projectId}</small>
+                      )}
+                    </div>
+                    <div className="project-picker-search">
+                      <span>⌕</span>
+                      <input
+                        value={editorProjectSearch}
+                        onChange={(event) =>
+                          setEditorProjectSearch(event.target.value)
+                        }
+                        placeholder="Escreve para filtrar projetos…"
+                        aria-label="Filtrar projeto da US"
+                      />
+                      {editorProjectSearch && (
+                        <button
+                          type="button"
+                          onClick={() => setEditorProjectSearch("")}
+                          aria-label="Limpar pesquisa de projetos"
+                        >
+                          ×
+                        </button>
+                      )}
+                    </div>
+                    {editorProjectNeedle && (
+                      <div className="project-picker-results" role="listbox">
+                        {matchingEditorProjects.map((project) => (
+                          <button
+                            type="button"
+                            key={project.projectId}
+                            role="option"
+                            aria-selected={project.projectId === editor.projectId}
+                            className={project.projectId === editor.projectId ? "selected" : ""}
+                            onClick={() => {
+                              setEditor({
+                                ...editor,
+                                projectId: project.projectId,
+                                labels: [],
+                              });
+                              setEditorProjectSearch("");
+                              refreshEditorProjectLabels(project.projectId);
+                            }}
+                          >
+                            <span>
+                              <strong>{project.project}</strong>
+                              <small>{project.client}</small>
+                            </span>
+                            <em>#{project.projectId}</em>
+                          </button>
+                        ))}
+                        {!matchingEditorProjects.length && (
+                          <p>Nenhum projeto encontrado.</p>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+              {editor.allocationId &&
+                editor.projectId !== undefined &&
+                editor.projectId !== editingIssue.projectId && (
+                  <div className="allocation-warning">
+                    <b>!</b>
+                    <p>
+                      Ao guardar, o GitLab move a US para o projeto escolhido e
+                      pode atribuir-lhe um novo número.
+                    </p>
+                  </div>
+                )}
+              {editor.allocationId && (
+                <div className="allocation-description label-picker-field">
+                  <span>Labels GitLab</span>
+                  {editorLabelsLoading ? (
+                    <div className="label-picker-state">A carregar labels do projeto…</div>
+                  ) : (labelCatalog[String(editor.projectId)] ?? []).length ? (
+                    <div className="label-picker" role="group" aria-label="Labels da US">
+                      {(labelCatalog[String(editor.projectId)] ?? []).map((label) => {
+                        const selected = (editor.labels ?? []).includes(label.name);
+                        return (
+                          <button
+                            type="button"
+                            key={label.name}
+                            className={selected ? "selected" : ""}
+                            onClick={() => toggleEditorLabel(label.name)}
+                            title={label.description || label.name}
+                            aria-pressed={selected}
+                          >
+                            <i style={{ backgroundColor: label.color }} />
+                            <span>{label.name}</span>
+                            <b>{selected ? "✓" : "+"}</b>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <div className="label-picker-state">Este projeto não tem labels definidas.</div>
+                  )}
+                </div>
+              )}
+              {editor.allocationId && (
+                <label>
+                  <span>Estado da US no GitLab</span>
+                  <select
+                    value={editor.issueState ?? editingIssue.state}
+                    onChange={(event) =>
+                      setEditor({
+                        ...editor,
+                        issueState: event.target.value as "opened" | "closed",
+                      })
+                    }
+                  >
+                    <option value="opened">Open</option>
+                    <option value="closed">Closed</option>
+                  </select>
+                </label>
+              )}
               <label>
                 <span>Minhas horas</span>
                 <input
@@ -3563,6 +4634,9 @@ function TimelineView({
                   </button>
                 </div>
               </label>
+              {editorError && (
+                <div className="create-task-error">{editorError}</div>
+              )}
             </div>
             <div className="allocation-modal-actions">
               {editor.allocationId && (
@@ -3585,13 +4659,12 @@ function TimelineView({
               </button>
               <button
                 className="primary-button"
-                disabled={!editor.description.trim()}
-                onClick={() => {
-                  saveAllocation(editor);
-                  setEditor(null);
-                }}
+                disabled={!editor.description.trim() || savingEditor}
+                onClick={() => void submitEditor()}
               >
-                {editor.allocationId
+                {savingEditor
+                  ? "A guardar…"
+                  : editor.allocationId
                   ? "Guardar alterações"
                   : "Adicionar à Timeline"}
               </button>
@@ -3638,32 +4711,77 @@ function TimelineView({
               </button>
             </div>
             <div className="allocation-form">
-              <label className="allocation-description">
+              <div className="allocation-description project-picker-field">
                 <span>Projeto GitLab</span>
-                <select
-                  value={createEditor.projectId}
-                  onChange={(event) => {
-                    const projectId = Number(event.target.value);
-                    setCreateEditor({
-                      ...createEditor,
-                      projectId,
-                      labels: [],
-                    });
-                    refreshProjectLabels(projectId);
-                  }}
-                >
-                  {gitlabProjects
-                    .filter((project) => project.projectId > 0)
-                    .map((project) => (
-                      <option
-                        key={project.projectId}
-                        value={project.projectId}
+                <div className="project-picker">
+                  <div className="project-picker-selected">
+                    <i />
+                    <span>
+                      {selectedCreateProject
+                        ? `${selectedCreateProject.client} · ${selectedCreateProject.project}`
+                        : "Escolhe um projeto"}
+                    </span>
+                    {selectedCreateProject && (
+                      <small>#{selectedCreateProject.projectId}</small>
+                    )}
+                  </div>
+                  <div className="project-picker-search">
+                    <span>⌕</span>
+                    <input
+                      value={projectSearch}
+                      onChange={(event) => setProjectSearch(event.target.value)}
+                      placeholder="Pesquisar cliente, projeto ou ID…"
+                      aria-label="Pesquisar projeto GitLab"
+                    />
+                    {projectSearch && (
+                      <button
+                        type="button"
+                        onClick={() => setProjectSearch("")}
+                        aria-label="Limpar pesquisa de projetos"
                       >
-                        {project.client} · {project.project}
-                      </option>
-                    ))}
-                </select>
-              </label>
+                        ×
+                      </button>
+                    )}
+                  </div>
+                  {projectSearchNeedle && (
+                    <div className="project-picker-results" role="listbox">
+                      {matchingProjects.map((project) => (
+                        <button
+                          type="button"
+                          key={project.projectId}
+                          role="option"
+                          aria-selected={
+                            project.projectId === createEditor.projectId
+                          }
+                          className={
+                            project.projectId === createEditor.projectId
+                              ? "selected"
+                              : ""
+                          }
+                          onClick={() => {
+                            setCreateEditor({
+                              ...createEditor,
+                              projectId: project.projectId,
+                              labels: [],
+                            });
+                            setProjectSearch("");
+                            refreshProjectLabels(project.projectId);
+                          }}
+                        >
+                          <span>
+                            <strong>{project.project}</strong>
+                            <small>{project.client}</small>
+                          </span>
+                          <em>#{project.projectId}</em>
+                        </button>
+                      ))}
+                      {!matchingProjects.length && (
+                        <p>Nenhum projeto encontrado.</p>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
               <label className="allocation-description">
                 <span>Título da tarefa</span>
                 <input
@@ -3680,18 +4798,80 @@ function TimelineView({
               </label>
               <label className="allocation-description">
                 <span>Descrição do trabalho</span>
-                <textarea
-                  rows={4}
+                <MarkdownEditor
                   value={createEditor.description}
-                  onChange={(event) =>
+                  onChange={(description) =>
                     setCreateEditor({
                       ...createEditor,
-                      description: event.target.value,
+                      description,
                     })
                   }
-                  placeholder="Descreve concretamente o que vais fazer. Esta descrição fica também na Issue do GitLab."
+                  renderMarkdown={(markdown) =>
+                    renderMarkdown(markdown, createEditor.projectId)
+                  }
+                  placeholder={"## Objetivo\n\nDescreve o trabalho a realizar. Podes usar listas, tabelas, links, checklists e outros elementos Markdown."}
                 />
               </label>
+              <div className="allocation-description related-issues-field">
+                <div className="related-issues-title">
+                  <span>US possivelmente relacionadas</span>
+                  <small>
+                    Sugestões calculadas pelo tema do título e da descrição
+                  </small>
+                </div>
+                {selectedRelatedIssues.length > 0 && (
+                  <div className="related-issues-selected">
+                    {selectedRelatedIssues.map((issue) => (
+                      <button
+                        type="button"
+                        key={issue.id}
+                        onClick={() => toggleRelatedIssue(issue.id)}
+                        title="Remover relação"
+                      >
+                        #{issue.iid} · {issue.title} <b>×</b>
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {relatedSuggestions.length ? (
+                  <div className="related-issue-suggestions">
+                    {relatedSuggestions.map(({ issue, matches }) => {
+                      const selected = createEditor.relatedIssueIds.includes(
+                        issue.id,
+                      );
+                      return (
+                        <button
+                          type="button"
+                          key={issue.id}
+                          className={selected ? "selected" : ""}
+                          onClick={() => toggleRelatedIssue(issue.id)}
+                          aria-pressed={selected}
+                        >
+                          <span>
+                            <small>
+                              {issue.client} · {issue.project} · #{issue.iid}
+                            </small>
+                            <strong>{issue.title}</strong>
+                            {matches.length > 0 && (
+                              <em>Em comum: {matches.join(", ")}</em>
+                            )}
+                          </span>
+                          <b>{selected ? "✓ Relacionar" : "+ Relacionar"}</b>
+                        </button>
+                      );
+                    })}
+                  </div>
+                ) : createEditor.title.trim().length > 2 ||
+                  createEditor.description.trim().length > 10 ? (
+                  <div className="related-issues-empty">
+                    Ainda não foram encontradas US com um tema semelhante.
+                  </div>
+                ) : (
+                  <div className="related-issues-empty">
+                    Começa a escrever para receber sugestões.
+                  </div>
+                )}
+              </div>
               <div className="allocation-description label-picker-field">
                 <span>Labels GitLab</span>
                 {labelsLoading ? (
@@ -3914,11 +5094,683 @@ function PeriodSelector({
   );
 }
 
+type FilterOption = { value: string; label: string; meta?: string };
+
+function MultiSelectFilter({
+  label,
+  options,
+  values,
+  onChange,
+  placeholder = "Pesquisar…",
+}: {
+  label: string;
+  options: FilterOption[];
+  values: string[];
+  onChange: (values: string[]) => void;
+  placeholder?: string;
+}) {
+  const [search, setSearch] = useState("");
+  const needle = search.trim().toLowerCase();
+  const visible = options.filter((option) =>
+    `${option.label} ${option.meta ?? ""}`.toLowerCase().includes(needle),
+  );
+  const selectedLabels = options
+    .filter((option) => values.includes(option.value))
+    .map((option) => option.label);
+
+  function toggle(value: string) {
+    onChange(
+      values.includes(value)
+        ? values.filter((item) => item !== value)
+        : [...values, value],
+    );
+  }
+
+  return (
+    <label className="multi-filter-label">
+      <span>{label}</span>
+      <details className="multi-filter">
+        <summary title={selectedLabels.join(", ")}>
+          <span>
+            {values.length === 0
+              ? `Todos os ${label.toLowerCase()}`
+              : values.length === 1
+                ? selectedLabels[0]
+                : `${values.length} selecionados`}
+          </span>
+          <b>⌄</b>
+        </summary>
+        <div className="multi-filter-popover">
+          <div className="multi-filter-search">
+            <span>⌕</span>
+            <input
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder={placeholder}
+              onClick={(event) => event.stopPropagation()}
+            />
+          </div>
+          <div className="multi-filter-actions">
+            <button type="button" onClick={() => onChange(visible.map((item) => item.value))}>
+              Selecionar visíveis
+            </button>
+            <button type="button" onClick={() => onChange([])}>Limpar</button>
+          </div>
+          <div className="multi-filter-options">
+            {visible.map((option) => (
+              <label key={option.value}>
+                <input
+                  type="checkbox"
+                  checked={values.includes(option.value)}
+                  onChange={() => toggle(option.value)}
+                />
+                <span>{option.label}</span>
+                {option.meta && <small>{option.meta}</small>}
+              </label>
+            ))}
+            {!visible.length && <p>Sem resultados.</p>}
+          </div>
+        </div>
+      </details>
+    </label>
+  );
+}
+
+function IssuesView({ issues, tasks }: { issues: IssueRecord[]; tasks: Task[] }) {
+  const [search, setSearch] = useState("");
+  const [projectIds, setProjectIds] = useState<string[]>([]);
+  const [state, setState] = useState<"all" | "opened" | "closed">("opened");
+  const [selectedLabels, setSelectedLabels] = useState<string[]>([]);
+  const [assigneeIds, setAssigneeIds] = useState<string[]>([]);
+  const [allocation, setAllocation] = useState<
+    "all" | "unplanned" | "partial" | "allocated"
+  >("all");
+  const plannedByIssue = useMemo(() => {
+    const totals = new Map<string, number>();
+    tasks.forEach((task) =>
+      totals.set(task.rootId, (totals.get(task.rootId) ?? 0) + task.estimate),
+    );
+    return totals;
+  }, [tasks]);
+  const projects = useMemo(
+    () =>
+      uniqueBy(issues, (issue) => String(issue.projectId)).sort(
+        (left, right) =>
+          left.client.localeCompare(right.client) ||
+          left.project.localeCompare(right.project),
+      ),
+    [issues],
+  );
+  const labels = useMemo(
+    () =>
+      [...new Set(issues.flatMap((issue) => issue.labels.map((item) => item.name)))].sort(
+        (left, right) => left.localeCompare(right),
+      ),
+    [issues],
+  );
+  const assignees = useMemo(() => {
+    const values = new Map<number, GitLabAssignee>();
+    issues.forEach((issue) =>
+      issue.assignees.forEach((item) => values.set(item.id, item)),
+    );
+    return [...values.values()].sort((left, right) =>
+      (left.name || left.username || "").localeCompare(
+        right.name || right.username || "",
+      ),
+    );
+  }, [issues]);
+  const needle = search.trim().toLowerCase();
+  const filtered = issues.filter((issue) => {
+    const planned = plannedByIssue.get(issue.id) ?? 0;
+    const remaining = Math.max(0, issue.estimateTotal - planned);
+    if (state !== "all" && issue.state !== state) return false;
+    if (projectIds.length && !projectIds.includes(String(issue.projectId)))
+      return false;
+    if (
+      selectedLabels.length &&
+      !issue.labels.some((item) => selectedLabels.includes(item.name))
+    ) return false;
+    if (assigneeIds.length && !(
+      (assigneeIds.includes("unassigned") && issue.assignees.length === 0) ||
+      issue.assignees.some((item) => assigneeIds.includes(String(item.id)))
+    ))
+      return false;
+    if (allocation === "unplanned" && planned > 0) return false;
+    if (allocation === "partial" && !(planned > 0 && remaining > 0.001))
+      return false;
+    if (allocation === "allocated" && remaining > 0.001) return false;
+    return (
+      !needle ||
+      `${issue.iid} ${issue.title} ${issue.client} ${issue.project} ${issue.labels.map((item) => item.name).join(" ")} ${issue.assignees.map((item) => `${item.name ?? ""} ${item.username ?? ""}`).join(" ")}`
+        .toLowerCase()
+        .includes(needle)
+    );
+  });
+  const teamHours = filtered.reduce(
+    (sum, issue) => sum + issue.estimateTotal,
+    0,
+  );
+  const plannedHours = filtered.reduce(
+    (sum, issue) => sum + (plannedByIssue.get(issue.id) ?? 0),
+    0,
+  );
+  const hoursToAllocate = filtered.reduce(
+    (sum, issue) =>
+      sum + Math.max(0, issue.estimateTotal - (plannedByIssue.get(issue.id) ?? 0)),
+    0,
+  );
+
+  function clearFilters() {
+    setSearch("");
+    setProjectIds([]);
+    setState("opened");
+    setSelectedLabels([]);
+    setAssigneeIds([]);
+    setAllocation("all");
+  }
+
+  return (
+    <div className="page wide-page issues-view">
+      <PageIntro
+        eyebrow="PESQUISA E CAPACIDADE"
+        title="Explorar US"
+        description="Combina filtros para localizar trabalho e perceber rapidamente quantas horas ainda precisam de alocação."
+      >
+        <button className="secondary-button" onClick={clearFilters}>
+          Limpar filtros
+        </button>
+      </PageIntro>
+      <section className="metrics-grid issue-metrics">
+        <article><small>US ENCONTRADAS</small><strong>{filtered.length}</strong><p>de {issues.length} sincronizadas</p></article>
+        <article><small>ESTIMATE DA EQUIPA</small><strong>{formatHours(teamHours)}</strong><p>nas US filtradas</p></article>
+        <article><small>JÁ ALOCADO</small><strong>{formatHours(plannedHours)}</strong><p>no planeamento pessoal</p></article>
+        <article><small>POR ALOCAR</small><strong>{formatHours(hoursToAllocate)}</strong><p>estimate ainda sem cobertura</p></article>
+      </section>
+      <section className="panel issue-explorer">
+        <div className="issue-explorer-filters">
+          <label className="issue-search-field">
+            <span>Pesquisar</span>
+            <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Título, número, projeto, label ou pessoa…" />
+          </label>
+          <MultiSelectFilter label="Projetos" values={projectIds} onChange={setProjectIds} placeholder="Pesquisar projeto…" options={projects.map((project) => ({ value: String(project.projectId), label: project.project, meta: project.client }))} />
+          <label><span>Estado</span><select value={state} onChange={(event) => setState(event.target.value as typeof state)}><option value="all">Todos</option><option value="opened">Open</option><option value="closed">Closed</option></select></label>
+          <MultiSelectFilter label="Labels" values={selectedLabels} onChange={setSelectedLabels} placeholder="Pesquisar label…" options={labels.map((name) => ({ value: name, label: name }))} />
+          <MultiSelectFilter label="Responsáveis" values={assigneeIds} onChange={setAssigneeIds} placeholder="Pesquisar responsável…" options={[{ value: "unassigned", label: "Sem responsável" }, ...assignees.map((item) => ({ value: String(item.id), label: item.name || item.username || `Utilizador ${item.id}`, meta: item.username }))]} />
+          <label><span>Alocação</span><select value={allocation} onChange={(event) => setAllocation(event.target.value as typeof allocation)}><option value="all">Qualquer situação</option><option value="unplanned">Sem alocação</option><option value="partial">Parcialmente alocada</option><option value="allocated">Totalmente alocada</option></select></label>
+        </div>
+        <div className="issue-results-head"><strong>{filtered.length} US</strong><span>Os filtros são combinados entre si</span></div>
+        <div className="issue-results">
+          {filtered.map((issue) => {
+            const planned = plannedByIssue.get(issue.id) ?? 0;
+            const remaining = Math.max(0, issue.estimateTotal - planned);
+            return (
+              <article key={issue.id} className="issue-result-row">
+                <div className="issue-result-main">
+                  <small>{issue.client} · {issue.project} · #{issue.iid}</small>
+                  {issue.webUrl ? <a href={issue.webUrl} target="_blank" rel="noreferrer">{issue.title} <span>↗</span></a> : <strong>{issue.title}</strong>}
+                  <IssueLabels labels={issue.labels} />
+                  <IssueAssignees assignees={issue.assignees} />
+                </div>
+                <div className="issue-result-hours"><span><small>Estimate</small><b>{issue.hasEstimate ? formatHours(issue.estimateTotal) : "—"}</b></span><span><small>Alocado</small><b>{formatHours(planned)}</b></span><span className={remaining > 0 ? "pending" : "done"}><small>Por alocar</small><b>{formatHours(remaining)}</b></span></div>
+              </article>
+            );
+          })}
+          {!filtered.length && <div className="empty-state"><span>⌕</span><strong>Nenhuma US corresponde aos filtros</strong><p>Altera ou limpa os filtros para alargar a pesquisa.</p></div>}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+const TEAM_WEEKDAYS = ["2ª Feira", "3ª Feira", "4ª Feira", "5ª Feira", "6ª Feira"];
+
+function teamWeekLabel(weekStart: string) {
+  const end = addDays(weekStart, 4);
+  return `${new Intl.DateTimeFormat("pt-PT", { day: "2-digit", month: "short" }).format(fromKey(weekStart))} — ${new Intl.DateTimeFormat("pt-PT", { day: "2-digit", month: "short", year: "numeric" }).format(fromKey(end))}`;
+}
+
+function escapeHtml(value: string) {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+function TeamAllocationView({
+  issues,
+  members,
+  allocations,
+  setMembers,
+  setAllocations,
+  todayKey,
+  setToast,
+}: {
+  issues: IssueRecord[];
+  members: TeamMember[];
+  allocations: TeamAllocation[];
+  setMembers: Dispatch<SetStateAction<TeamMember[]>>;
+  setAllocations: Dispatch<SetStateAction<TeamAllocation[]>>;
+  todayKey: string;
+  setToast: (message: string) => void;
+}) {
+  const [weekStart, setWeekStart] = useState(() => mondayFor(todayKey));
+  const [search, setSearch] = useState("");
+  const [projectIds, setProjectIds] = useState<string[]>([]);
+  const [selectedLabels, setSelectedLabels] = useState<string[]>([]);
+  const [assigneeIds, setAssigneeIds] = useState<string[]>([]);
+  const [state, setState] = useState<"all" | "opened" | "closed">("opened");
+  const [allocationFilter, setAllocationFilter] = useState<
+    "all" | "unplanned" | "partial" | "allocated"
+  >("all");
+  const [draftHours, setDraftHours] = useState<Record<string, number>>({});
+  const [draggedIssueId, setDraggedIssueId] = useState<string | null>(null);
+  const [selectedAllocationId, setSelectedAllocationId] = useState<string | null>(null);
+  const [newMemberName, setNewMemberName] = useState("");
+  const [customTitle, setCustomTitle] = useState("");
+  const [customHours, setCustomHours] = useState(8);
+
+  const issueById = useMemo(
+    () => new Map(issues.map((issue) => [issue.id, issue])),
+    [issues],
+  );
+  const currentAllocations = allocations.filter(
+    (allocation) => allocation.weekStart === weekStart,
+  );
+  const allocatedByIssue = useMemo(() => {
+    const totals = new Map<string, number>();
+    allocations
+      .filter((allocation) => allocation.weekStart === weekStart && allocation.issueId)
+      .forEach((allocation) =>
+        totals.set(
+          allocation.issueId!,
+          (totals.get(allocation.issueId!) ?? 0) + allocation.hours,
+        ),
+      );
+    return totals;
+  }, [allocations, weekStart]);
+  const projects = useMemo(
+    () =>
+      uniqueBy(issues, (issue) => String(issue.projectId)).sort(
+        (left, right) =>
+          left.client.localeCompare(right.client) ||
+          left.project.localeCompare(right.project),
+      ),
+    [issues],
+  );
+  const labels = useMemo(
+    () =>
+      [...new Set(issues.flatMap((issue) => issue.labels.map((item) => item.name)))].sort(
+        (left, right) => left.localeCompare(right),
+      ),
+    [issues],
+  );
+  const assignees = useMemo(() => {
+    const values = new Map<number, GitLabAssignee>();
+    issues.forEach((issue) =>
+      issue.assignees.forEach((item) => values.set(item.id, item)),
+    );
+    return [...values.values()].sort((left, right) =>
+      (left.name || left.username || "").localeCompare(
+        right.name || right.username || "",
+      ),
+    );
+  }, [issues]);
+  const needle = search.trim().toLowerCase();
+  const filteredIssues = issues.filter((issue) => {
+    const allocated = allocatedByIssue.get(issue.id) ?? 0;
+    const estimate = Math.max(0, issue.estimateTotal);
+    const remaining = Math.max(0, estimate - allocated);
+    if (state !== "all" && issue.state !== state) return false;
+    if (projectIds.length && !projectIds.includes(String(issue.projectId))) return false;
+    if (
+      selectedLabels.length &&
+      !issue.labels.some((item) => selectedLabels.includes(item.name))
+    ) return false;
+    if (assigneeIds.length && !(
+      (assigneeIds.includes("unassigned") && issue.assignees.length === 0) ||
+      issue.assignees.some((item) => assigneeIds.includes(String(item.id)))
+    )) return false;
+    if (allocationFilter === "unplanned" && allocated > 0) return false;
+    if (allocationFilter === "partial" && !(allocated > 0 && remaining > 0.001)) return false;
+    if (allocationFilter === "allocated" && (estimate <= 0 || remaining > 0.001)) return false;
+    return !needle || `${issue.iid} ${issue.title} ${issue.client} ${issue.project} ${issue.labels.map((item) => item.name).join(" ")} ${issue.assignees.map((item) => `${item.name ?? ""} ${item.username ?? ""}`).join(" ")}`.toLowerCase().includes(needle);
+  });
+  const selectedAllocation = allocations.find(
+    (allocation) => allocation.id === selectedAllocationId,
+  );
+
+  function defaultHours(issue: IssueRecord) {
+    return Math.min(40, Math.max(1, Math.round(issue.estimateTotal || 1)));
+  }
+
+  function hasCollision(
+    memberId: string,
+    startSlot: number,
+    hours: number,
+    ignoreId?: string,
+  ) {
+    const end = startSlot + hours;
+    return currentAllocations.some(
+      (allocation) =>
+        allocation.memberId === memberId &&
+        allocation.id !== ignoreId &&
+        startSlot < allocation.startSlot + allocation.hours &&
+        end > allocation.startSlot,
+    );
+  }
+
+  function addAllocation(memberId: string, startSlot: number, issueId: string) {
+    const issue = issueById.get(issueId);
+    if (!issue) return;
+    const hours = Math.min(
+      40 - startSlot,
+      Math.max(1, Math.round(draftHours[issueId] ?? defaultHours(issue))),
+    );
+    if (hasCollision(memberId, startSlot, hours)) {
+      setToast("Esse período já tem uma alocação. Escolhe outra célula ou ajusta as horas.");
+      return;
+    }
+    const allocation: TeamAllocation = {
+      id: crypto.randomUUID(),
+      memberId,
+      issueId,
+      weekStart,
+      startSlot,
+      hours,
+    };
+    setAllocations((current) => [...current, allocation]);
+    setSelectedAllocationId(allocation.id);
+  }
+
+  function addCustomAllocation() {
+    const title = customTitle.trim();
+    if (!title || !members[0]) {
+      setToast("Indica o nome do bloco e adiciona pelo menos uma pessoa.");
+      return;
+    }
+    const hours = Math.min(40, Math.max(1, Math.round(customHours)));
+    const firstFree = Array.from({ length: 40 }, (_, slot) => slot).find(
+      (slot) => slot + hours <= 40 && !hasCollision(members[0].id, slot, hours),
+    );
+    if (firstFree === undefined) {
+      setToast("A primeira pessoa não tem espaço livre suficiente nesta semana.");
+      return;
+    }
+    const allocation: TeamAllocation = {
+      id: crypto.randomUUID(),
+      memberId: members[0].id,
+      customTitle: title,
+      customColor: "#8b91a7",
+      weekStart,
+      startSlot: firstFree,
+      hours,
+    };
+    setAllocations((current) => [...current, allocation]);
+    setSelectedAllocationId(allocation.id);
+    setCustomTitle("");
+  }
+
+  function updateAllocation(
+    allocationId: string,
+    patch: Partial<TeamAllocation>,
+  ) {
+    setAllocations((current) =>
+      current.map((allocation) => {
+        if (allocation.id !== allocationId) return allocation;
+        const memberId = patch.memberId ?? allocation.memberId;
+        const startSlot = Math.min(39, Math.max(0, patch.startSlot ?? allocation.startSlot));
+        const hours = Math.min(
+          40 - startSlot,
+          Math.max(1, Math.round(patch.hours ?? allocation.hours)),
+        );
+        if (hasCollision(memberId, startSlot, hours, allocationId)) {
+          setToast("A alteração sobrepõe outra alocação.");
+          return allocation;
+        }
+        return { ...allocation, ...patch, memberId, startSlot, hours };
+      }),
+    );
+  }
+
+  function addMember() {
+    const name = newMemberName.trim();
+    if (!name) return;
+    setMembers((current) => [
+      ...current,
+      { id: crypto.randomUUID(), name },
+    ]);
+    setNewMemberName("");
+  }
+
+  function removeMember(member: TeamMember) {
+    if (!window.confirm(`Remover ${member.name} e as respetivas alocações?`)) return;
+    setMembers((current) => current.filter((item) => item.id !== member.id));
+    setAllocations((current) =>
+      current.filter((allocation) => allocation.memberId !== member.id),
+    );
+    setSelectedAllocationId(null);
+  }
+
+  function allocationText(allocation: TeamAllocation) {
+    const issue = allocation.issueId ? issueById.get(allocation.issueId) : null;
+    return issue
+      ? `${issue.project} · #${issue.iid} ${issue.title}`
+      : allocation.customTitle ?? "Bloco livre";
+  }
+
+  function buildEmailTable() {
+    const percentRow = Array.from({ length: 40 }, () => "<th>2.5%</th>").join("");
+    const hourRow = Array.from({ length: 40 }, (_, index) => `<th>${(index % 8) + 1}</th>`).join("");
+    const dayRow = TEAM_WEEKDAYS.map((day) => `<th colspan="8">${day}</th>`).join("");
+    const body = members.map((member) => {
+      const byStart = new Map(
+        currentAllocations
+          .filter((allocation) => allocation.memberId === member.id)
+          .sort((left, right) => left.startSlot - right.startSlot)
+          .map((allocation) => [allocation.startSlot, allocation]),
+      );
+      const cells: string[] = [];
+      for (let slot = 0; slot < 40;) {
+        const allocation = byStart.get(slot);
+        if (!allocation) {
+          cells.push("<td></td>");
+          slot += 1;
+          continue;
+        }
+        const issue = allocation.issueId ? issueById.get(allocation.issueId) : null;
+        const project = issue?.project ?? allocation.customTitle ?? "Outro";
+        const issueLine = issue
+          ? issue.webUrl
+            ? `<br><a href="${escapeHtml(issue.webUrl)}">#${issue.iid} ${escapeHtml(issue.title)}</a>`
+            : `<br>#${issue.iid} ${escapeHtml(issue.title)}`
+          : "";
+        cells.push(`<td colspan="${allocation.hours}" style="background:${issue?.color ?? allocation.customColor ?? "#8b91a7"}22;border-left:4px solid ${issue?.color ?? allocation.customColor ?? "#8b91a7"};padding:6px"><strong>${escapeHtml(project)}</strong>${issueLine}</td>`);
+        slot += allocation.hours;
+      }
+      return `<tr><th style="text-align:left;white-space:nowrap">${escapeHtml(member.name)}${member.role ? ` (${escapeHtml(member.role)})` : ""}</th>${cells.join("")}</tr>`;
+    }).join("");
+    return `<table style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:12px" border="1" cellpadding="4"><thead><tr><th></th>${percentRow}</tr><tr><th></th>${hourRow}</tr><tr><th>${escapeHtml(teamWeekLabel(weekStart))}</th>${dayRow}</tr></thead><tbody>${body}</tbody></table>`;
+  }
+
+  async function copyForEmail() {
+    const html = buildEmailTable();
+    const plainRows = members.map((member) => {
+      const slots = Array.from({ length: 40 }, () => "");
+      currentAllocations
+        .filter((allocation) => allocation.memberId === member.id)
+        .forEach((allocation) => {
+          slots[allocation.startSlot] = allocationText(allocation);
+        });
+      return [member.name, ...slots].join("\t");
+    });
+    const plain = [
+      ["", ...Array.from({ length: 40 }, () => "2.5%")].join("\t"),
+      ["", ...Array.from({ length: 40 }, (_, index) => String((index % 8) + 1))].join("\t"),
+      ...plainRows,
+    ].join("\n");
+    try {
+      if (typeof ClipboardItem !== "undefined" && navigator.clipboard.write) {
+        await navigator.clipboard.write([
+          new ClipboardItem({
+            "text/html": new Blob([html], { type: "text/html" }),
+            "text/plain": new Blob([plain], { type: "text/plain" }),
+          }),
+        ]);
+      } else {
+        await navigator.clipboard.writeText(plain);
+      }
+      setToast("Tabela copiada. Já podes colá-la no corpo do e-mail.");
+    } catch {
+      setToast("O browser bloqueou a cópia. Autoriza o acesso à área de transferência.");
+    }
+  }
+
+  function exportTeamCsv() {
+    const header = [
+      "Pessoa",
+      ...TEAM_WEEKDAYS.flatMap((day) =>
+        Array.from({ length: 8 }, (_, index) => `${day} ${index + 1}`),
+      ),
+    ];
+    const rows = members.map((member) => {
+      const slots = Array.from({ length: 40 }, () => "");
+      currentAllocations
+        .filter((allocation) => allocation.memberId === member.id)
+        .forEach((allocation) => {
+          const text = allocationText(allocation);
+          for (let slot = allocation.startSlot; slot < allocation.startSlot + allocation.hours; slot++) {
+            slots[slot] = text;
+          }
+        });
+      return [member.name, ...slots];
+    });
+    const csv = [header, ...rows]
+      .map((row) => row.map((value) => `"${String(value).replaceAll('"', '""')}"`).join(";"))
+      .join("\n");
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(new Blob([`\uFEFF${csv}`], { type: "text/csv;charset=utf-8" }));
+    link.download = `alocacao-equipa-${weekStart}.csv`;
+    link.click();
+    URL.revokeObjectURL(link.href);
+  }
+
+  return (
+    <div className="page team-allocation-view">
+      <PageIntro
+        eyebrow="CAPACIDADE DA EQUIPA"
+        title="Alocação semanal"
+        description="Arrasta US para a grelha de 40 horas. Cada célula representa 1 hora e 2,5% da semana."
+      >
+        <div className="team-week-nav">
+          <button onClick={() => setWeekStart(addDays(weekStart, -7))}>←</button>
+          <strong>{teamWeekLabel(weekStart)}</strong>
+          <button onClick={() => setWeekStart(addDays(weekStart, 7))}>→</button>
+          <button className="secondary-button" onClick={() => setWeekStart(mondayFor(todayKey))}>Esta semana</button>
+        </div>
+      </PageIntro>
+
+      <section className="team-allocation-layout">
+        <aside className="panel team-issue-palette">
+          <div className="team-palette-head">
+            <div><small>BACKLOG</small><strong>{filteredIssues.length} US disponíveis</strong></div>
+          </div>
+          <div className="team-issue-filters">
+            <label className="issue-search-field"><span>Pesquisar</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Título, número ou projeto…" /></label>
+            <MultiSelectFilter label="Projetos" values={projectIds} onChange={setProjectIds} placeholder="Pesquisar projeto…" options={projects.map((project) => ({ value: String(project.projectId), label: project.project, meta: project.client }))} />
+            <MultiSelectFilter label="Labels" values={selectedLabels} onChange={setSelectedLabels} placeholder="Pesquisar label…" options={labels.map((name) => ({ value: name, label: name }))} />
+            <MultiSelectFilter label="Responsáveis" values={assigneeIds} onChange={setAssigneeIds} placeholder="Pesquisar responsável…" options={[{ value: "unassigned", label: "Sem responsável" }, ...assignees.map((item) => ({ value: String(item.id), label: item.name || item.username || `Utilizador ${item.id}`, meta: item.username }))]} />
+            <label><span>Estado</span><select value={state} onChange={(event) => setState(event.target.value as typeof state)}><option value="all">Todos</option><option value="opened">Open</option><option value="closed">Closed</option></select></label>
+            <label><span>Alocação semanal</span><select value={allocationFilter} onChange={(event) => setAllocationFilter(event.target.value as typeof allocationFilter)}><option value="all">Qualquer situação</option><option value="unplanned">Sem alocação</option><option value="partial">Parcial</option><option value="allocated">Total</option></select></label>
+          </div>
+          <div className="team-issue-list">
+            {filteredIssues.map((issue) => {
+              const hours = draftHours[issue.id] ?? defaultHours(issue);
+              const allocated = allocatedByIssue.get(issue.id) ?? 0;
+              return (
+                <article
+                  key={issue.id}
+                  className={`team-issue-card ${draggedIssueId === issue.id ? "dragging" : ""}`}
+                  draggable
+                  onDragStart={(event) => {
+                    event.dataTransfer.setData("application/x-work-organizer-issue", issue.id);
+                    event.dataTransfer.effectAllowed = "copy";
+                    setDraggedIssueId(issue.id);
+                  }}
+                  onDragEnd={() => setDraggedIssueId(null)}
+                >
+                  <span className="team-issue-color" style={{ background: issue.color }} />
+                  <div><small>{issue.client} · {issue.project} · #{issue.iid}</small><strong>{issue.title}</strong><IssueLabels labels={issue.labels} /></div>
+                  <label onClick={(event) => event.stopPropagation()}><span>Horas</span><input type="number" min="1" max="40" step="1" value={hours} onChange={(event) => setDraftHours((current) => ({ ...current, [issue.id]: Math.min(40, Math.max(1, Number(event.target.value) || 1)) }))} /></label>
+                  <small className="team-allocated-note">{formatHours(allocated)} nesta semana</small>
+                </article>
+              );
+            })}
+            {!filteredIssues.length && <div className="empty-state compact"><span>⌕</span><strong>Sem US para estes filtros</strong></div>}
+          </div>
+          <div className="custom-allocation-form">
+            <strong>Ausência ou outro bloco</strong>
+            <input value={customTitle} onChange={(event) => setCustomTitle(event.target.value)} placeholder="Ex.: Férias, Formação…" />
+            <label><span>Horas</span><input type="number" min="1" max="40" value={customHours} onChange={(event) => setCustomHours(Number(event.target.value) || 1)} /></label>
+            <button className="secondary-button" onClick={addCustomAllocation}>Adicionar bloco</button>
+          </div>
+        </aside>
+
+        <section className="panel team-board-panel">
+          <div className="team-board-toolbar">
+            <div className="team-add-member"><input value={newMemberName} onChange={(event) => setNewMemberName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") addMember(); }} placeholder="Nome da pessoa" /><button onClick={addMember}>+ Adicionar pessoa</button></div>
+            <div><button className="secondary-button" onClick={exportTeamCsv}>Exportar CSV</button><button className="primary-button" onClick={copyForEmail}>Copiar para e-mail</button></div>
+          </div>
+
+          {selectedAllocation && (
+            <div className="team-allocation-editor">
+              <strong>{allocationText(selectedAllocation)}</strong>
+              <label><span>Pessoa</span><select value={selectedAllocation.memberId} onChange={(event) => updateAllocation(selectedAllocation.id, { memberId: event.target.value })}>{members.map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select></label>
+              <label><span>Dia</span><select value={Math.floor(selectedAllocation.startSlot / 8)} onChange={(event) => updateAllocation(selectedAllocation.id, { startSlot: Number(event.target.value) * 8 + (selectedAllocation.startSlot % 8) })}>{TEAM_WEEKDAYS.map((day, index) => <option key={day} value={index}>{day}</option>)}</select></label>
+              <label><span>Hora</span><select value={selectedAllocation.startSlot % 8} onChange={(event) => updateAllocation(selectedAllocation.id, { startSlot: Math.floor(selectedAllocation.startSlot / 8) * 8 + Number(event.target.value) })}>{Array.from({ length: 8 }, (_, index) => <option key={index} value={index}>{index + 1}</option>)}</select></label>
+              <label><span>Horas</span><input type="number" min="1" max={40 - selectedAllocation.startSlot} value={selectedAllocation.hours} onChange={(event) => updateAllocation(selectedAllocation.id, { hours: Number(event.target.value) || 1 })} /></label>
+              <button className="danger-button" onClick={() => { setAllocations((current) => current.filter((item) => item.id !== selectedAllocation.id)); setSelectedAllocationId(null); }}>Remover</button>
+              <button className="icon-button" aria-label="Fechar editor" onClick={() => setSelectedAllocationId(null)}>×</button>
+            </div>
+          )}
+
+          <div className="team-board-scroll">
+            <div className="team-hours-grid team-grid-header">
+              <div className="team-grid-corner" style={{ gridRow: 1 }}><strong>Pessoa</strong><small>40 h semanais</small></div>
+              {Array.from({ length: 40 }, (_, slot) => <div key={`percent-${slot}`} className="team-percent-cell">2.5%</div>)}
+              <div className="team-grid-corner secondary" style={{ gridRow: 2 }}><span>Semana</span></div>
+              {TEAM_WEEKDAYS.map((day, dayIndex) => <div key={day} className="team-day-cell" style={{ gridColumn: `${dayIndex * 8 + 2} / span 8`, gridRow: 2 }}><strong>{day}</strong><small>{formatDate(addDays(weekStart, dayIndex))}</small></div>)}
+              <div className="team-grid-corner secondary" style={{ gridRow: 3 }}><span>Hora</span></div>
+              {Array.from({ length: 40 }, (_, slot) => <div key={`hour-${slot}`} className="team-hour-cell">{(slot % 8) + 1}</div>)}
+            </div>
+            {members.map((member) => {
+              const memberAllocations = currentAllocations.filter((allocation) => allocation.memberId === member.id);
+              const total = memberAllocations.reduce((sum, allocation) => sum + allocation.hours, 0);
+              return (
+                <div className="team-hours-grid team-member-row" key={member.id}>
+                  <div className="team-member-cell"><div><strong>{member.name}</strong>{member.role && <small>{member.role}</small>}<span>{formatHours(total)} · {Math.round((total / 40) * 100)}%</span></div><button aria-label={`Remover ${member.name}`} onClick={() => removeMember(member)}>×</button></div>
+                  {Array.from({ length: 40 }, (_, slot) => <button key={slot} className={`team-drop-cell ${(slot + 1) % 8 === 0 ? "day-end" : ""}`} aria-label={`${member.name}, ${TEAM_WEEKDAYS[Math.floor(slot / 8)]}, hora ${(slot % 8) + 1}`} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "copy"; }} onDrop={(event) => { event.preventDefault(); const issueId = event.dataTransfer.getData("application/x-work-organizer-issue") || draggedIssueId; if (issueId) addAllocation(member.id, slot, issueId); }} />)}
+                  {memberAllocations.map((allocation) => {
+                    const issue = allocation.issueId ? issueById.get(allocation.issueId) : null;
+                    return <div key={allocation.id} role="button" tabIndex={0} className={`team-allocation-block ${selectedAllocationId === allocation.id ? "selected" : ""}`} style={{ gridColumn: `${allocation.startSlot + 2} / span ${allocation.hours}`, borderColor: issue?.color ?? allocation.customColor ?? "#8b91a7", background: `${issue?.color ?? allocation.customColor ?? "#8b91a7"}20` }} onClick={() => setSelectedAllocationId(allocation.id)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") setSelectedAllocationId(allocation.id); }} title={`${allocationText(allocation)} · ${formatHours(allocation.hours)}`}><strong>{issue?.project ?? allocation.customTitle}</strong>{issue && (issue.webUrl ? <a href={issue.webUrl} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>#{issue.iid} {issue.title}</a> : <span>#{issue.iid} {issue.title}</span>)}<small>{formatHours(allocation.hours)}</small></div>;
+                  })}
+                </div>
+              );
+            })}
+            {!members.length && <div className="empty-state"><span>＋</span><strong>Adiciona a primeira pessoa da equipa</strong><p>As pessoas formam as linhas da tabela semanal.</p></div>}
+          </div>
+          <div className="team-board-legend"><span><i />1 célula = 1 h = 2,5%</span><span>{currentAllocations.length} blocos nesta semana</span><span>{formatHours(currentAllocations.reduce((sum, allocation) => sum + allocation.hours, 0))} alocadas</span></div>
+        </section>
+      </section>
+    </div>
+  );
+}
+
 function CompletedView({
-  logs,
+  tasks,
   todayKey,
 }: {
-  logs: WorkLog[];
+  tasks: Task[];
   todayKey: string;
 }) {
   const [period, setPeriod] = useState<Zoom | "all">("week");
@@ -3926,7 +5778,26 @@ function CompletedView({
   const [client, setClient] = useState("all");
   const [type, setType] = useState("all");
   const start = periodStart(todayKey, period);
-  const filtered = logs.filter(
+  // This is a record of work allocated in the Timeline. It must not depend on
+  // an issue's current state or a later GitLab closure date.
+  const timelineRecords: WorkLog[] = tasks
+    .map((task) => ({
+      id: `timeline-${task.id}`,
+      dateKey: task.date,
+      client: task.client,
+      project: task.project,
+      task: task.title,
+      description: task.description,
+      type: task.phase,
+      hours: task.estimate,
+      estimate: task.estimate,
+      webUrl: task.webUrl,
+      projectId: task.projectId,
+      issueIid: task.iid,
+      source: "timeline" as const,
+    }))
+    .sort((left, right) => right.dateKey.localeCompare(left.dateKey));
+  const filtered = timelineRecords.filter(
     (log) =>
       log.dateKey >= start &&
       (client === "all" || log.client === client) &&
@@ -3936,7 +5807,7 @@ function CompletedView({
         .includes(search.toLowerCase()),
   );
   const total = filtered.reduce((sum, log) => sum + log.hours, 0);
-  const todayTotal = logs
+  const todayTotal = timelineRecords
     .filter((log) => log.dateKey === todayKey)
     .reduce((sum, log) => sum + log.hours, 0);
   return (
@@ -3944,7 +5815,7 @@ function CompletedView({
       <PageIntro
         eyebrow="REGISTO DE TEMPO"
         title="Trabalho realizado"
-        description="Issues concluídas e sessões registadas, organizadas por cliente e projeto."
+        description="Alocações registadas na Timeline, organizadas por cliente e projeto."
       >
         <PeriodSelector value={period} onChange={setPeriod} allowAll />
         <button
@@ -3993,9 +5864,11 @@ function CompletedView({
             aria-label="Filtrar por cliente"
           >
             <option value="all">Todos os clientes</option>
-            {[...new Set(logs.map((log) => log.client))].sort().map((value) => (
+            {[...new Set(timelineRecords.map((log) => log.client))]
+              .sort()
+              .map((value) => (
               <option key={value}>{value}</option>
-            ))}
+              ))}
           </select>
           <select
             value={type}
@@ -4003,9 +5876,11 @@ function CompletedView({
             aria-label="Filtrar por tipo"
           >
             <option value="all">Todos os tipos</option>
-            {[...new Set(logs.map((log) => log.type))].sort().map((value) => (
+            {[...new Set(timelineRecords.map((log) => log.type))]
+              .sort()
+              .map((value) => (
               <option key={value}>{value}</option>
-            ))}
+              ))}
           </select>
         </div>
         <div className="work-table">
@@ -4038,6 +5913,7 @@ function CompletedView({
                 ) : (
                   log.task
                 )}
+                {log.description && <small>{log.description}</small>}
               </span>
               <span>
                 <i className={`type-dot ${log.type.toLowerCase()}`} />
@@ -4356,7 +6232,7 @@ function SettingsView(props: {
               onChange={(event) =>
                 setConfig({ ...config, token: event.target.value })
               }
-              placeholder="glpat-••••••••••••••••••••"
+              placeholder="Introduz o token de acesso"
               autoComplete="off"
             />
             <button type="button" onClick={() => setShowToken(!showToken)}>
@@ -4937,9 +6813,16 @@ function projectTotals(tasks: Task[]) {
 
 function exportCsv(logs: WorkLog[]) {
   const csv = [
-    "Data;Cliente;Projeto;Tarefa;Tipo;Horas",
+    "Data;Projeto;Tipo de Tarefa;Titulo;Descrição;Tempo Gasto",
     ...logs.map((log) =>
-      [log.dateKey, log.client, log.project, log.task, log.type, log.hours]
+      [
+        log.dateKey,
+        log.project,
+        log.type,
+        log.task,
+        log.description ?? "",
+        log.hours,
+      ]
         .map((value) => `"${String(value).replace(/"/g, '""')}"`)
         .join(";"),
     ),

@@ -2,16 +2,20 @@ import { NextRequest, NextResponse } from "next/server";
 import { getChatGPTUser } from "../../chatgpt-auth";
 
 type GitLabRequest = {
-  action?: "test" | "sync" | "addSpent" | "createIssue" | "projectLabels";
+  action?: "test" | "sync" | "addSpent" | "createIssue" | "projectLabels" | "renderMarkdown" | "updateIssueState" | "updateIssueDescription" | "updateIssueLabels" | "moveIssue";
   baseUrl?: string;
   token?: string;
   projectId?: number;
+  toProjectId?: number;
   issueIid?: number;
   duration?: string;
   title?: string;
   description?: string;
+  markdown?: string;
   estimateHours?: number;
   labels?: string[];
+  relatedIssues?: { projectId?: number; issueIid?: number }[];
+  state?: "opened" | "closed";
 };
 
 function normaliseBaseUrl(input: string) {
@@ -159,22 +163,54 @@ export async function POST(request: NextRequest) {
     }
 
     if (body.action === "sync") {
-      const query = new URLSearchParams({ scope: "assigned_to_me", state: "all", non_archived: "true", order_by: "updated_at", sort: "desc" });
-      const [user, issues, projects] = await Promise.all([
+      // Keep the planning dataset focused: all accessible Site Server issues
+      // updated in the last month, regardless of their assignee.
+      const [user, allProjects] = await Promise.all([
         gitlabFetch(baseUrl, token, "/user"),
-        gitlabFetchAll(baseUrl, token, `/issues?${query}`),
         gitlabFetchAll(baseUrl, token, "/projects?membership=true&archived=false&with_issues_enabled=true&simple=true"),
       ]);
+      const projects = (allProjects as {
+        id?: number;
+        name?: string;
+        name_with_namespace?: string;
+        path_with_namespace?: string;
+      }[]).filter((project) =>
+        `${project.name ?? ""} ${project.name_with_namespace ?? ""} ${project.path_with_namespace ?? ""}`
+          .toLowerCase()
+          .includes("site server"),
+      );
+      const projectIds = new Set(
+        projects.map((project) => project.id).filter((id): id is number => Boolean(id)),
+      );
+      const updatedAfter = new Date();
+      updatedAfter.setMonth(updatedAfter.getMonth() - 1);
+      const query = new URLSearchParams({
+        scope: "all",
+        state: "all",
+        non_archived: "true",
+        updated_after: updatedAfter.toISOString(),
+        order_by: "updated_at",
+        sort: "desc",
+      });
+      const issues = (await gitlabFetchAll(baseUrl, token, `/issues?${query}`)).filter(
+        (issue) => projectIds.has((issue as { project_id?: number }).project_id ?? 0),
+      );
       let timelogs: Awaited<ReturnType<typeof fetchMyTimelogs>> = [];
       let timelogWarning: string | undefined;
       try {
         const username = String((user as { username?: string }).username ?? "");
-        if (username) timelogs = await fetchMyTimelogs(baseUrl, token, username);
+        if (username) {
+          timelogs = (await fetchMyTimelogs(baseUrl, token, username)).filter(
+            (entry) =>
+              projectIds.has(entry.project_id) &&
+              entry.spent_at >= updatedAfter.toISOString(),
+          );
+        }
       } catch (error) {
         timelogWarning = error instanceof Error ? error.message : "Não foi possível consultar os timelogs pessoais.";
       }
-      const projectIds = [...new Set((issues as { project_id?: number }[]).map((issue) => issue.project_id).filter((id): id is number => Boolean(id)))];
-      const labelEntries = await Promise.all(projectIds.map(async (projectId) => {
+      const issueProjectIds = [...new Set((issues as { project_id?: number }[]).map((issue) => issue.project_id).filter((id): id is number => Boolean(id)))];
+      const labelEntries = await Promise.all(issueProjectIds.map(async (projectId) => {
         try {
           const labels = await gitlabFetchAll(baseUrl, token, `/projects/${projectId}/labels`);
           return [String(projectId), labels] as const;
@@ -190,6 +226,112 @@ export async function POST(request: NextRequest) {
       if (!body.projectId) throw new Error("Seleciona um projeto GitLab.");
       const labels = await gitlabFetchAll(baseUrl, token, `/projects/${body.projectId}/labels`);
       return NextResponse.json({ ok: true, labels });
+    }
+
+    if (body.action === "renderMarkdown") {
+      let project: string | undefined;
+      if (body.projectId) {
+        const context = (await gitlabFetch(
+          baseUrl,
+          token,
+          `/projects/${body.projectId}`,
+        )) as { path_with_namespace?: string };
+        project = context.path_with_namespace;
+      }
+      const rendered = await gitlabFetch(baseUrl, token, "/markdown", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text: body.markdown ?? "",
+          gfm: true,
+          ...(project ? { project } : {}),
+        }),
+      });
+      return NextResponse.json({
+        ok: true,
+        html: (rendered as { html?: string }).html ?? "",
+      });
+    }
+
+    if (body.action === "updateIssueState") {
+      if (
+        !body.projectId ||
+        !body.issueIid ||
+        (body.state !== "opened" && body.state !== "closed")
+      ) {
+        throw new Error("Faltam dados da US ou do estado.");
+      }
+      const issue = await gitlabFetch(
+        baseUrl,
+        token,
+        `/projects/${body.projectId}/issues/${body.issueIid}`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            state_event: body.state === "closed" ? "close" : "reopen",
+          }),
+        },
+      );
+      return NextResponse.json({ ok: true, issue });
+    }
+
+    if (body.action === "updateIssueDescription") {
+      if (!body.projectId || !body.issueIid) {
+        throw new Error("Faltam dados da US.");
+      }
+      const issue = await gitlabFetch(
+        baseUrl,
+        token,
+        `/projects/${body.projectId}/issues/${body.issueIid}`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ description: body.description ?? "" }),
+        },
+      );
+      return NextResponse.json({ ok: true, issue });
+    }
+
+    if (body.action === "updateIssueLabels") {
+      if (!body.projectId || !body.issueIid || !Array.isArray(body.labels)) {
+        throw new Error("Faltam dados da US ou das labels.");
+      }
+      const issue = await gitlabFetch(
+        baseUrl,
+        token,
+        `/projects/${body.projectId}/issues/${body.issueIid}`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            labels: body.labels
+              .filter((label) => typeof label === "string" && label.trim())
+              .join(","),
+          }),
+        },
+      );
+      return NextResponse.json({ ok: true, issue });
+    }
+
+    if (body.action === "moveIssue") {
+      if (!body.projectId || !body.issueIid || !body.toProjectId) {
+        throw new Error("Seleciona o projeto de destino da US.");
+      }
+      if (body.projectId === body.toProjectId) {
+        throw new Error("A US já pertence ao projeto selecionado.");
+      }
+      const issue = await gitlabFetch(
+        baseUrl,
+        token,
+        `/projects/${body.projectId}/issues/${body.issueIid}/move`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ to_project_id: body.toProjectId }),
+        },
+      );
+      return NextResponse.json({ ok: true, issue });
     }
 
     if (body.action === "addSpent") {
@@ -233,11 +375,40 @@ export async function POST(request: NextRequest) {
         const duration = encodeURIComponent(`${Math.round(estimateHours * 60)}m`);
         await gitlabFetch(baseUrl, token, `/projects/${body.projectId}/issues/${created.iid}/time_estimate?duration=${duration}`, { method: "POST" });
       }
+      const relatedIssues = (body.relatedIssues ?? []).filter(
+        (related) => related.projectId && related.issueIid,
+      );
+      const linkResults = await Promise.allSettled(
+        relatedIssues.map((related) =>
+          gitlabFetch(
+            baseUrl,
+            token,
+            `/projects/${body.projectId}/issues/${created.iid}/links`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                target_project_id: related.projectId,
+                target_issue_iid: related.issueIid,
+                link_type: "relates_to",
+              }),
+            },
+          ),
+        ),
+      );
+      const failedRelatedIssues = linkResults.filter(
+        (result) => result.status === "rejected",
+      ).length;
       const [issue, project] = await Promise.all([
         gitlabFetch(baseUrl, token, `/projects/${body.projectId}/issues/${created.iid}`),
         gitlabFetch(baseUrl, token, `/projects/${body.projectId}`),
       ]);
-      return NextResponse.json({ ok: true, issue, project });
+      return NextResponse.json({
+        ok: true,
+        issue,
+        project,
+        failedRelatedIssues,
+      });
     }
 
     throw new Error("Ação desconhecida.");

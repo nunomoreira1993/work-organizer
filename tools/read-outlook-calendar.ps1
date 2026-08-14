@@ -1,4 +1,7 @@
-param([ValidateRange(1, 90)][int]$Days = 35)
+param(
+    [datetime]$StartDate = (Get-Date),
+    [ValidateRange(1, 90)][int]$Days = 35
+)
 
 $ErrorActionPreference = "Stop"
 $outlook = $null
@@ -14,7 +17,7 @@ try {
     $items.Sort("[Start]")
     $items.IncludeRecurrences = $true
 
-    $start = Get-Date
+    $start = $StartDate
     $end = $start.AddDays($Days)
     $restriction = "[Start] >= '" + $start.ToString("g") + "' AND [Start] < '" + $end.ToString("g") + "'"
     $events = @()

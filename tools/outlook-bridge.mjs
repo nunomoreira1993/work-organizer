@@ -43,7 +43,7 @@ function send(response, status, body, origin) {
   response.end(JSON.stringify(body));
 }
 
-function readCalendar(days) {
+function readCalendar(start, days) {
   return new Promise((resolve, reject) => {
     // Execute the checked-in source in memory. A downloaded repository can carry
     // Zone.Identifier metadata, and an enforced PowerShell policy may then reject
@@ -51,7 +51,7 @@ function readCalendar(days) {
     const sourceBase64 = Buffer.from(scriptSource, "utf8").toString("base64");
     const command = [
       "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)",
-      `& ([scriptblock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${sourceBase64}')))) -Days ${days}`,
+      `& ([scriptblock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${sourceBase64}')))) -StartDate '${start}' -Days ${days}`,
     ].join("; ");
     const encodedCommand = Buffer.from(command, "utf16le").toString("base64");
     const child = spawn("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encodedCommand], { windowsHide: true });
@@ -84,10 +84,17 @@ const server = createServer(async (request, response) => {
   }
   if (origin && !isAllowedOrigin(origin)) return send(response, 403, { ok: false, error: "Origem não autorizada." }, "");
   const url = new URL(request.url || "/", `http://${host}:${port}`);
+  if (request.method === "GET" && url.pathname === "/health") {
+    return send(response, 200, { ok: true }, origin);
+  }
   if (request.method !== "GET" || url.pathname !== "/calendar") return send(response, 404, { ok: false, error: "Endpoint inexistente." }, origin);
   const days = Math.min(90, Math.max(1, Number(url.searchParams.get("days")) || 35));
+  const requestedStart = url.searchParams.get("start");
+  const start = /^\d{4}-\d{2}-\d{2}$/.test(requestedStart ?? "")
+    ? requestedStart
+    : new Date().toISOString().slice(0, 10);
   try {
-    const events = await readCalendar(days);
+    const events = await readCalendar(start, days);
     send(response, 200, { ok: true, events: Array.isArray(events) ? events : [events] }, origin);
   } catch (error) {
     send(response, 500, { ok: false, error: error instanceof Error ? error.message : "Falha ao ler o Outlook." }, origin);

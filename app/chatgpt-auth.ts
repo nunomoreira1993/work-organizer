@@ -16,7 +16,19 @@ const SIGN_IN_PATH = "/signin-with-chatgpt";
 const SIGN_OUT_PATH = "/signout-with-chatgpt";
 const CALLBACK_PATH = "/callback";
 
+export function isLocalOrganizer(): boolean {
+  return process.env.WORK_ORGANIZER_LOCAL === "true";
+}
+
 export async function getChatGPTUser(): Promise<ChatGPTUser | null> {
+  if (isLocalOrganizer()) {
+    return {
+      displayName: "Nuno Moreira",
+      email: "local@work-organizer",
+      fullName: "Nuno Moreira",
+    };
+  }
+
   const requestHeaders = await headers();
   const email = requestHeaders.get(USER_EMAIL_HEADER);
   if (!email) return null;
