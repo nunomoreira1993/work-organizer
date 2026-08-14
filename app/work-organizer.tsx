@@ -5852,10 +5852,15 @@ function TeamAllocationView({
             {filteredIssues.map((issue) => {
               const hours = draftHours[issue.id] ?? defaultHours(issue);
               const allocated = allocatedByIssue.get(issue.id) ?? 0;
+              const allocationState = allocated <= 0
+                ? "unallocated"
+                : issue.estimateTotal > 0 && allocated + 0.001 >= issue.estimateTotal
+                  ? "fully-allocated"
+                  : "partially-allocated";
               return (
                 <article
                   key={issue.id}
-                  className={`team-issue-card ${draggedIssueId === issue.id ? "dragging" : ""}`}
+                  className={`team-issue-card ${allocationState} ${draggedIssueId === issue.id ? "dragging" : ""}`}
                   draggable
                   onDragStart={(event) => {
                     event.dataTransfer.setData("application/x-work-organizer-issue", issue.id);
@@ -5867,7 +5872,7 @@ function TeamAllocationView({
                   <span className="team-issue-color" style={{ background: issue.color }} />
                   <div><small>{issue.client} · {issue.project} · #{issue.iid}</small><strong>{issue.title}</strong><IssueLabels labels={issue.labels} /></div>
                   <label onClick={(event) => event.stopPropagation()}><span>Horas</span><input type="number" min="1" max="40" step="1" value={hours} onChange={(event) => setDraftHours((current) => ({ ...current, [issue.id]: Math.min(40, Math.max(1, Number(event.target.value) || 1)) }))} /></label>
-                  <small className="team-allocated-note">{formatHours(allocated)} nesta semana</small>
+                  <small className="team-allocated-note"><b>{allocationState === "fully-allocated" ? "✓ Totalmente alocada" : allocationState === "partially-allocated" ? "◐ Parcialmente alocada" : "○ Ainda não alocada"}</b><span>{formatHours(allocated)} nesta semana{issue.estimateTotal > 0 ? ` / ${formatHours(issue.estimateTotal)}` : ""}</span></small>
                 </article>
               );
             })}

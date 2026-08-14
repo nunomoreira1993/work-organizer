@@ -4265,6 +4265,15 @@ button:disabled {
   border-bottom: 1px solid #eceef2;
   background: #fff;
   cursor: grab;
+  transition: background 140ms ease, box-shadow 140ms ease;
+}
+.team-issue-card.partially-allocated {
+  background: #fff9eb;
+  box-shadow: inset 4px 0 0 #e3a52e;
+}
+.team-issue-card.fully-allocated {
+  background: #edf9f3;
+  box-shadow: inset 4px 0 0 #2a9b72;
 }
 .team-issue-card.dragging { opacity: 0.45; }
 .team-issue-color { position: absolute; top: 11px; bottom: 11px; left: 6px; width: 3px; border-radius: 3px; }
@@ -4273,7 +4282,10 @@ button:disabled {
 .team-issue-card > div > strong { display: -webkit-box; overflow: hidden; color: #3e4655; font-size: 9px; line-height: 1.35; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
 .team-issue-card > label { display: flex; flex-direction: column; gap: 4px; color: #858d9b; font-size: 7px; }
 .team-issue-card > label input { width: 55px; height: 30px; padding: 0 7px; border: 1px solid #dfe1e7; border-radius: 7px; }
-.team-allocated-note { grid-column: 1 / -1; color: #6f6adb; font-size: 7px; }
+.team-allocated-note { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; gap: 8px; color: #8b92a0; font-size: 7px; }
+.team-allocated-note b { color: #7c8492; font-weight: 700; }
+.team-issue-card.partially-allocated .team-allocated-note b { color: #b77a0d; }
+.team-issue-card.fully-allocated .team-allocated-note b { color: #238461; }
 .custom-allocation-form {
   padding: 11px;
   display: grid;
