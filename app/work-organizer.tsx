@@ -5403,6 +5403,12 @@ function TeamAllocationView({
   const [draftHours, setDraftHours] = useState<Record<string, number>>({});
   const [draggedIssueId, setDraggedIssueId] = useState<string | null>(null);
   const [draggedAllocationId, setDraggedAllocationId] = useState<string | null>(null);
+  const [dropPreview, setDropPreview] = useState<{
+    memberId: string;
+    startSlot: number;
+    hours: number;
+    valid: boolean;
+  } | null>(null);
   const [selectedAllocationId, setSelectedAllocationId] = useState<string | null>(null);
   const [newMemberName, setNewMemberName] = useState("");
   const [customTitle, setCustomTitle] = useState("");
@@ -5540,6 +5546,36 @@ function TeamAllocationView({
     return startSlot === undefined
       ? null
       : { startSlot, hours: preferred.hours };
+  }
+
+  function previewDrop(memberId: string, hoveredSlot: number) {
+    const draggedAllocation = draggedAllocationId
+      ? allocations.find((allocation) => allocation.id === draggedAllocationId)
+      : null;
+    const draggedIssue = draggedIssueId ? issueById.get(draggedIssueId) : null;
+    const requestedHours = draggedAllocation
+      ? draggedAllocation.hours
+      : draggedIssue
+        ? draftHours[draggedIssue.id] ?? defaultHours(draggedIssue)
+        : 1;
+    const placement = findAvailablePlacement(
+      memberId,
+      hoveredSlot,
+      requestedHours,
+      draggedAllocation?.id,
+    );
+    const next = placement
+      ? { memberId, ...placement, valid: true }
+      : { memberId, startSlot: hoveredSlot, hours: 1, valid: false };
+    setDropPreview((current) =>
+      current &&
+      current.memberId === next.memberId &&
+      current.startSlot === next.startSlot &&
+      current.hours === next.hours &&
+      current.valid === next.valid
+        ? current
+        : next,
+    );
   }
 
   function addAllocation(memberId: string, startSlot: number, issueId: string) {
@@ -5874,7 +5910,7 @@ function TeamAllocationView({
                     event.dataTransfer.effectAllowed = "copy";
                     setDraggedIssueId(issue.id);
                   }}
-                  onDragEnd={() => setDraggedIssueId(null)}
+                  onDragEnd={() => { setDraggedIssueId(null); setDropPreview(null); }}
                 >
                   <span className="team-issue-color" style={{ background: issue.color }} />
                   <div><small>{issue.client} · {issue.project} · #{issue.iid}</small><strong>{issue.title}</strong><IssueLabels labels={issue.labels} /></div>
@@ -5930,11 +5966,14 @@ function TeamAllocationView({
               return (
                 <div className="team-hours-grid team-member-row" key={member.id}>
                   <div className="team-member-cell"><div><strong>{member.name}</strong>{member.role && <small>{member.role}</small>}<span>{formatHours(total)} · {Math.round((total / 40) * 100)}%</span></div><button aria-label={`Remover ${member.name}`} onClick={() => removeMember(member)}>×</button></div>
-                  {Array.from({ length: 40 }, (_, slot) => <button key={slot} style={{ gridColumn: slot + 2 }} className={`team-drop-cell ${(slot + 1) % 8 === 0 ? "day-end" : ""}`} aria-label={`${member.name}, ${TEAM_WEEKDAYS[Math.floor(slot / 8)]}, hora ${(slot % 8) + 1}`} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = draggedAllocationId ? "move" : "copy"; }} onDrop={(event) => { event.preventDefault(); const allocationId = event.dataTransfer.getData("application/x-work-organizer-allocation") || draggedAllocationId; if (allocationId) { moveAllocation(allocationId, member.id, slot); return; } const issueId = event.dataTransfer.getData("application/x-work-organizer-issue") || draggedIssueId; if (issueId) addAllocation(member.id, slot, issueId); }} />)}
+                  {Array.from({ length: 40 }, (_, slot) => {
+                    const isPreview = dropPreview?.memberId === member.id && slot >= dropPreview.startSlot && slot < dropPreview.startSlot + dropPreview.hours;
+                    return <button key={slot} style={{ gridColumn: slot + 2 }} className={`team-drop-cell ${(slot + 1) % 8 === 0 ? "day-end" : ""} ${isPreview ? dropPreview.valid ? "drop-preview" : "drop-preview-invalid" : ""} ${isPreview && slot === dropPreview.startSlot ? "drop-preview-start" : ""}`} aria-label={`${member.name}, ${TEAM_WEEKDAYS[Math.floor(slot / 8)]}, hora ${(slot % 8) + 1}`} onDragEnter={(event) => { event.preventDefault(); previewDrop(member.id, slot); }} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = draggedAllocationId ? "move" : "copy"; previewDrop(member.id, slot); }} onDrop={(event) => { event.preventDefault(); setDropPreview(null); const allocationId = event.dataTransfer.getData("application/x-work-organizer-allocation") || draggedAllocationId; if (allocationId) { moveAllocation(allocationId, member.id, slot); return; } const issueId = event.dataTransfer.getData("application/x-work-organizer-issue") || draggedIssueId; if (issueId) addAllocation(member.id, slot, issueId); }} />;
+                  })}
                   {[7, 15, 23, 31].map((slot) => <div key={`divider-${slot}`} className="team-member-day-divider" style={{ gridColumn: slot + 2 }} />)}
                   {memberAllocations.map((allocation) => {
                     const issue = allocation.issueId ? issueById.get(allocation.issueId) : null;
-                    return <div key={allocation.id} role="button" tabIndex={0} draggable className={`team-allocation-block ${draggedAllocationId === allocation.id ? "dragging" : ""} ${!issue ? `absence absence-${allocation.absenceType ?? "other"}` : ""} ${selectedAllocationId === allocation.id ? "selected" : ""}`} style={{ gridColumn: `${allocation.startSlot + 2} / span ${allocation.hours}`, borderColor: issue?.color ?? allocation.customColor ?? "#8b91a7", background: `${issue?.color ?? allocation.customColor ?? "#8b91a7"}20` }} onDragStart={(event) => { event.dataTransfer.setData("application/x-work-organizer-allocation", allocation.id); event.dataTransfer.effectAllowed = "move"; setDraggedAllocationId(allocation.id); }} onDragEnd={() => setDraggedAllocationId(null)} onClick={() => setSelectedAllocationId(allocation.id)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") setSelectedAllocationId(allocation.id); if (event.key === "Delete" || event.key === "Backspace") removeAllocation(allocation.id); }} title={`${allocationText(allocation)} · ${formatHours(allocation.hours)} · arrasta para mover`}><button type="button" className="team-allocation-remove" aria-label={`Remover ${allocationText(allocation)}`} title="Remover da alocação" onClick={(event) => { event.stopPropagation(); removeAllocation(allocation.id); }}>×</button><strong>{issue?.project ?? allocation.customTitle}</strong>{issue && (issue.webUrl ? <a href={issue.webUrl} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>#{issue.iid} {issue.title}</a> : <span>#{issue.iid} {issue.title}</span>)}{!issue && <span>{TEAM_ABSENCE_TYPES[allocation.absenceType ?? "other"].label} · sem cliente/US</span>}<small>{formatHours(allocation.hours)}</small></div>;
+                    return <div key={allocation.id} role="button" tabIndex={0} draggable className={`team-allocation-block ${draggedAllocationId === allocation.id ? "dragging" : ""} ${!issue ? `absence absence-${allocation.absenceType ?? "other"}` : ""} ${selectedAllocationId === allocation.id ? "selected" : ""}`} style={{ gridColumn: `${allocation.startSlot + 2} / span ${allocation.hours}`, borderColor: issue?.color ?? allocation.customColor ?? "#8b91a7", background: `${issue?.color ?? allocation.customColor ?? "#8b91a7"}20` }} onDragStart={(event) => { event.dataTransfer.setData("application/x-work-organizer-allocation", allocation.id); event.dataTransfer.effectAllowed = "move"; setDraggedAllocationId(allocation.id); }} onDragEnd={() => { setDraggedAllocationId(null); setDropPreview(null); }} onClick={() => setSelectedAllocationId(allocation.id)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") setSelectedAllocationId(allocation.id); if (event.key === "Delete" || event.key === "Backspace") removeAllocation(allocation.id); }} title={`${allocationText(allocation)} · ${formatHours(allocation.hours)} · arrasta para mover`}><button type="button" className="team-allocation-remove" aria-label={`Remover ${allocationText(allocation)}`} title="Remover da alocação" onClick={(event) => { event.stopPropagation(); removeAllocation(allocation.id); }}>×</button><strong>{issue?.project ?? allocation.customTitle}</strong>{issue && (issue.webUrl ? <a href={issue.webUrl} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>#{issue.iid} {issue.title}</a> : <span>#{issue.iid} {issue.title}</span>)}{!issue && <span>{TEAM_ABSENCE_TYPES[allocation.absenceType ?? "other"].label} · sem cliente/US</span>}<small>{formatHours(allocation.hours)}</small></div>;
                   })}
                 </div>
               );
