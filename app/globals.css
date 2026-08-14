@@ -4440,6 +4440,12 @@ button:disabled {
 }
 .team-allocation-block:active { cursor: grabbing; }
 .team-allocation-block.dragging { opacity: 0.4; }
+.team-allocation-block.timeline-derived {
+  border-style: dashed;
+  background: repeating-linear-gradient(135deg, #edf4ff, #edf4ff 7px, #e2edff 7px, #e2edff 14px) !important;
+  cursor: default;
+}
+.team-allocation-block.timeline-derived small { color: #3977d5; }
 .team-member-day-divider {
   z-index: 6;
   grid-row: 1;
@@ -4510,6 +4516,7 @@ button:disabled {
 }
 .team-board-legend span { display: inline-flex; align-items: center; gap: 5px; }
 .team-board-legend i { width: 9px; height: 9px; border: 1px solid #cfccd9; background: #fff; }
+.team-board-legend .timeline-legend i { border-color: #7aa2df; background: #e7f0ff; }
 
 @media (max-width: 1180px) {
   .issue-explorer-filters { grid-template-columns: repeat(3, minmax(150px, 1fr)); }

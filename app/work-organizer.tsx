@@ -184,6 +184,10 @@ type TeamAllocation = {
   weekStart: string;
   startSlot: number;
   hours: number;
+  timelineTaskId?: string;
+  timelineTitle?: string;
+  timelineWebUrl?: string;
+  actualHours?: number;
 };
 
 type PersistedState = {
@@ -2544,11 +2548,14 @@ export default function WorkOrganizer({
         {view === "team" && (
           <TeamAllocationView
             issues={issues}
+            tasks={tasks}
             members={teamMembers}
             allocations={teamAllocations}
             setMembers={setTeamMembers}
             setAllocations={setTeamAllocations}
             todayKey={todayKey}
+            capacity={capacity}
+            currentUserName={user.displayName}
             setToast={setToast}
           />
         )}
@@ -5376,19 +5383,25 @@ function escapeHtml(value: string) {
 
 function TeamAllocationView({
   issues,
+  tasks,
   members,
   allocations,
   setMembers,
   setAllocations,
   todayKey,
+  capacity,
+  currentUserName,
   setToast,
 }: {
   issues: IssueRecord[];
+  tasks: Task[];
   members: TeamMember[];
   allocations: TeamAllocation[];
   setMembers: Dispatch<SetStateAction<TeamMember[]>>;
   setAllocations: Dispatch<SetStateAction<TeamAllocation[]>>;
   todayKey: string;
+  capacity: CapacityConfig;
+  currentUserName: string;
   setToast: (message: string) => void;
 }) {
   const [weekStart, setWeekStart] = useState(() => mondayFor(todayKey));
@@ -5428,21 +5441,124 @@ function TeamAllocationView({
     () => new Map(issues.map((issue) => [issue.id, issue])),
     [issues],
   );
-  const currentAllocations = allocations.filter(
-    (allocation) => allocation.weekStart === weekStart,
+  const currentAllocations = useMemo(
+    () => allocations.filter((allocation) => allocation.weekStart === weekStart),
+    [allocations, weekStart],
+  );
+  const timelineAllocations = useMemo(() => {
+    const normaliseName = (value: string) => value
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .trim()
+      .toLowerCase();
+    const ownMember = members.find(
+      (member) => normaliseName(member.name) === normaliseName(currentUserName),
+    );
+    if (!ownMember) return [];
+    const weekDates = new Map(
+      Array.from({ length: 5 }, (_, dayIndex) => [addDays(weekStart, dayIndex), dayIndex]),
+    );
+    const occupied = currentAllocations
+      .filter((allocation) => allocation.memberId === ownMember.id)
+      .map((allocation) => ({
+        startSlot: allocation.startSlot,
+        hours: allocation.hours,
+      }));
+    const manuallyAllocatedIssues = new Set(
+      currentAllocations
+        .filter((allocation) => allocation.memberId === ownMember.id && allocation.issueId)
+        .map((allocation) => allocation.issueId),
+    );
+    const weekTasks = tasks.filter(
+      (task) => weekDates.has(task.date) && task.estimate > 0,
+    );
+    const outlookByDate = new Map<string, Task[]>();
+    weekTasks
+      .filter((task) => task.source === "outlook")
+      .forEach((task) =>
+        outlookByDate.set(task.date, [...(outlookByDate.get(task.date) ?? []), task]),
+      );
+    const timelineTasks = [
+      ...weekTasks.filter((task) => task.source !== "outlook"),
+      ...[...outlookByDate.entries()].map(([date, dayMeetings]) => {
+        const first = dayMeetings[0];
+        const titles = dayMeetings.map((meeting) => meeting.title);
+        return {
+          ...first,
+          id: `outlook-day-${date}`,
+          rootId: `outlook-day-${date}`,
+          allocationId: `outlook-day-${date}`,
+          title: dayMeetings.length === 1
+            ? first.title
+            : `Reuniões (${dayMeetings.length}): ${titles.join(" · ")}`,
+          project: "Reuniões",
+          client: "Outlook",
+          color: "#3977d5",
+          start: Math.min(...dayMeetings.map((meeting) => meeting.start)),
+          estimate: dayMeetings.reduce((sum, meeting) => sum + meeting.estimate, 0),
+          webUrl: dayMeetings.length === 1 ? first.webUrl : undefined,
+        } satisfies Task;
+      }),
+    ];
+    const result: TeamAllocation[] = [];
+    timelineTasks
+      .sort((left, right) => left.date.localeCompare(right.date) || left.start - right.start)
+      .forEach((task) => {
+        const issue = issueById.get(task.rootId);
+        if (issue && manuallyAllocatedIssues.has(issue.id)) return;
+        const dayIndex = weekDates.get(task.date)!;
+        const dayStart = dayIndex * 8;
+        const slots = Math.min(8, Math.max(1, Math.ceil(task.estimate)));
+        const preferred = dayStart + Math.min(
+          8 - slots,
+          Math.max(0, Math.floor(task.start - capacity.startHour)),
+        );
+        const candidates = Array.from(
+          { length: 9 - slots },
+          (_, offset) => dayStart + offset,
+        ).sort((left, right) => Math.abs(left - preferred) - Math.abs(right - preferred));
+        const startSlot = candidates.find((candidate) =>
+          occupied.every(
+            (allocation) =>
+              candidate + slots <= allocation.startSlot ||
+              candidate >= allocation.startSlot + allocation.hours,
+          ),
+        );
+        if (startSlot === undefined) return;
+        occupied.push({ startSlot, hours: slots });
+        result.push({
+          id: `timeline-${task.id}`,
+          memberId: ownMember.id,
+          issueId: issue?.id,
+          customTitle: issue?.project ?? task.project ?? (task.source === "outlook" ? "Reuniões" : "Timeline"),
+          customColor: task.color || (task.source === "outlook" ? "#3977d5" : "#625df2"),
+          weekStart,
+          startSlot,
+          hours: slots,
+          timelineTaskId: task.id,
+          timelineTitle: task.title,
+          timelineWebUrl: task.webUrl,
+          actualHours: task.estimate,
+        });
+      });
+    return result;
+  }, [capacity.startHour, currentAllocations, currentUserName, issueById, members, tasks, weekStart]);
+  const displayedAllocations = useMemo(
+    () => [...currentAllocations, ...timelineAllocations],
+    [currentAllocations, timelineAllocations],
   );
   const allocatedByIssue = useMemo(() => {
     const totals = new Map<string, number>();
-    allocations
-      .filter((allocation) => allocation.weekStart === weekStart && allocation.issueId)
+    displayedAllocations
+      .filter((allocation) => allocation.issueId)
       .forEach((allocation) =>
         totals.set(
           allocation.issueId!,
-          (totals.get(allocation.issueId!) ?? 0) + allocation.hours,
+          (totals.get(allocation.issueId!) ?? 0) + (allocation.actualHours ?? allocation.hours),
         ),
       );
     return totals;
-  }, [allocations, weekStart]);
+  }, [displayedAllocations]);
   const projects = useMemo(
     () =>
       uniqueBy(issues, (issue) => String(issue.projectId)).sort(
@@ -5505,7 +5621,7 @@ function TeamAllocationView({
     ignoreId?: string,
   ) {
     const end = startSlot + hours;
-    return currentAllocations.some(
+    return displayedAllocations.some(
       (allocation) =>
         allocation.memberId === memberId &&
         allocation.id !== ignoreId &&
@@ -5710,9 +5826,16 @@ function TeamAllocationView({
 
   function allocationText(allocation: TeamAllocation) {
     const issue = allocation.issueId ? issueById.get(allocation.issueId) : null;
+    if (allocation.timelineTaskId) {
+      return `${issue?.project ?? allocation.customTitle ?? "Timeline"} · ${allocation.timelineTitle ?? issue?.title ?? "Planeamento"}`;
+    }
     return issue
       ? `${issue.project} · #${issue.iid} ${issue.title}`
       : allocation.customTitle ?? "Bloco livre";
+  }
+
+  function allocationHours(allocation: TeamAllocation) {
+    return allocation.actualHours ?? allocation.hours;
   }
 
   function buildEmailTable() {
@@ -5723,10 +5846,10 @@ function TeamAllocationView({
     const corner = (content: string) => `<th style="width:210px;padding:0 12px;text-align:left;color:#4d5564;border-right:1px solid ${border};border-bottom:1px solid ${border};background:#fafbfc;font-size:10px">${content}</th>`;
     const columns = `<colgroup><col style="width:210px">${Array.from({ length: 40 }, () => '<col style="width:30px">').join("")}</colgroup>`;
     const body = members.map((member) => {
-      const memberAllocations = currentAllocations.filter(
+      const memberAllocations = displayedAllocations.filter(
         (allocation) => allocation.memberId === member.id,
       );
-      const total = memberAllocations.reduce((sum, allocation) => sum + allocation.hours, 0);
+      const total = memberAllocations.reduce((sum, allocation) => sum + allocationHours(allocation), 0);
       const byStart = new Map(
         memberAllocations
           .sort((left, right) => left.startSlot - right.startSlot)
@@ -5742,14 +5865,18 @@ function TeamAllocationView({
         }
         const issue = allocation.issueId ? issueById.get(allocation.issueId) : null;
         const project = issue?.project ?? allocation.customTitle ?? "Outro";
-        const issueLine = issue
+        const issueLine = allocation.timelineTaskId
+          ? allocation.timelineWebUrl
+            ? `<br><a href="${escapeHtml(allocation.timelineWebUrl)}" style="color:#596171;text-decoration:none;font-size:10px">${escapeHtml(allocation.timelineTitle ?? "Planeamento da Timeline")}</a>`
+            : `<br><span style="color:#596171;font-size:10px">${escapeHtml(allocation.timelineTitle ?? "Planeamento da Timeline")}</span>`
+          : issue
           ? issue.webUrl
             ? `<br><a href="${escapeHtml(issue.webUrl)}" style="color:#596171;text-decoration:none;font-size:10px">#${issue.iid} ${escapeHtml(issue.title)}</a>`
             : `<br><span style="color:#596171;font-size:10px">#${issue.iid} ${escapeHtml(issue.title)}</span>`
           : `<br><span style="color:#747b87;font-size:9px;font-style:italic">${TEAM_ABSENCE_TYPES[allocation.absenceType ?? "other"].label} · sem cliente/US</span>`;
         const color = issue?.color ?? allocation.customColor ?? "#8b91a7";
-        const background = issue ? `${color}20` : allocation.absenceType === "vacation" ? "#fff0d5" : allocation.absenceType === "absence" ? "#fbe1e4" : allocation.absenceType === "training" ? "#ddf3ed" : "#eceef2";
-        cells.push(`<td colspan="${allocation.hours}" style="height:50px;padding:6px 8px;vertical-align:middle;color:#3e4655;border-right:1px solid ${border};border-bottom:1px solid ${border};border-left:4px ${issue ? "solid" : "dashed"} ${color};background:${background};font-family:Arial,sans-serif"><strong style="display:block;font-size:11px">${escapeHtml(project)}</strong>${issueLine}<span style="float:right;color:#6a65dd;font-size:9px">${formatHours(allocation.hours)}</span></td>`);
+        const background = allocation.timelineTaskId ? "#eaf2ff" : issue ? `${color}20` : allocation.absenceType === "vacation" ? "#fff0d5" : allocation.absenceType === "absence" ? "#fbe1e4" : allocation.absenceType === "training" ? "#ddf3ed" : "#eceef2";
+        cells.push(`<td colspan="${allocation.hours}" style="height:50px;padding:6px 8px;vertical-align:middle;color:#3e4655;border-right:1px solid ${border};border-bottom:1px solid ${border};border-left:4px ${issue && !allocation.timelineTaskId ? "solid" : "dashed"} ${color};background:${background};font-family:Arial,sans-serif"><strong style="display:block;font-size:11px">${escapeHtml(project)}</strong>${issueLine}<span style="float:right;color:#6a65dd;font-size:9px">${formatHours(allocationHours(allocation))}</span></td>`);
         slot += allocation.hours;
       }
       return `<tr><th style="height:62px;padding:8px 10px;text-align:left;vertical-align:middle;white-space:nowrap;color:#343c4b;border-right:1px solid ${border};border-bottom:1px solid ${border};background:#fff;font-size:11px">${escapeHtml(member.name)}${member.role ? `<br><span style="color:#9198a5;font-size:9px;font-weight:400">${escapeHtml(member.role)}</span>` : ""}<br><span style="color:#6560dc;font-size:9px;font-weight:400">${formatHours(total)} · ${Math.round((total / 40) * 100)}%</span></th>${cells.join("")}</tr>`;
@@ -5761,7 +5888,7 @@ function TeamAllocationView({
     const html = buildEmailTable();
     const plainRows = members.map((member) => {
       const slots = Array.from({ length: 40 }, () => "");
-      currentAllocations
+      displayedAllocations
         .filter((allocation) => allocation.memberId === member.id)
         .forEach((allocation) => {
           slots[allocation.startSlot] = allocationText(allocation);
@@ -5796,7 +5923,7 @@ function TeamAllocationView({
     );
     const rows = members.map((member) => {
       const slots = Array.from({ length: 40 }, () => "");
-      currentAllocations
+      displayedAllocations
         .filter((allocation) => allocation.memberId === member.id)
         .forEach((allocation) => {
           const text = allocationText(allocation);
@@ -5843,7 +5970,7 @@ function TeamAllocationView({
     ];
     const rows = members.map((member) => {
       const slots = Array.from({ length: 40 }, () => "");
-      currentAllocations
+      displayedAllocations
         .filter((allocation) => allocation.memberId === member.id)
         .forEach((allocation) => {
           const text = allocationText(allocation);
@@ -5961,8 +6088,8 @@ function TeamAllocationView({
               {Array.from({ length: 40 }, (_, slot) => <div key={`hour-${slot}`} className={`team-hour-cell ${(slot + 1) % 8 === 0 ? "day-end" : ""}`}>{(slot % 8) + 1}</div>)}
             </div>
             {members.map((member) => {
-              const memberAllocations = currentAllocations.filter((allocation) => allocation.memberId === member.id);
-              const total = memberAllocations.reduce((sum, allocation) => sum + allocation.hours, 0);
+              const memberAllocations = displayedAllocations.filter((allocation) => allocation.memberId === member.id);
+              const total = memberAllocations.reduce((sum, allocation) => sum + allocationHours(allocation), 0);
               return (
                 <div className="team-hours-grid team-member-row" key={member.id}>
                   <div className="team-member-cell"><div><strong>{member.name}</strong>{member.role && <small>{member.role}</small>}<span>{formatHours(total)} · {Math.round((total / 40) * 100)}%</span></div><button aria-label={`Remover ${member.name}`} onClick={() => removeMember(member)}>×</button></div>
@@ -5973,14 +6100,15 @@ function TeamAllocationView({
                   {[7, 15, 23, 31].map((slot) => <div key={`divider-${slot}`} className="team-member-day-divider" style={{ gridColumn: slot + 2 }} />)}
                   {memberAllocations.map((allocation) => {
                     const issue = allocation.issueId ? issueById.get(allocation.issueId) : null;
-                    return <div key={allocation.id} role="button" tabIndex={0} draggable className={`team-allocation-block ${draggedAllocationId === allocation.id ? "dragging" : ""} ${!issue ? `absence absence-${allocation.absenceType ?? "other"}` : ""} ${selectedAllocationId === allocation.id ? "selected" : ""}`} style={{ gridColumn: `${allocation.startSlot + 2} / span ${allocation.hours}`, borderColor: issue?.color ?? allocation.customColor ?? "#8b91a7", background: `${issue?.color ?? allocation.customColor ?? "#8b91a7"}20` }} onDragStart={(event) => { event.dataTransfer.setData("application/x-work-organizer-allocation", allocation.id); event.dataTransfer.effectAllowed = "move"; setDraggedAllocationId(allocation.id); }} onDragEnd={() => { setDraggedAllocationId(null); setDropPreview(null); }} onClick={() => setSelectedAllocationId(allocation.id)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") setSelectedAllocationId(allocation.id); if (event.key === "Delete" || event.key === "Backspace") removeAllocation(allocation.id); }} title={`${allocationText(allocation)} · ${formatHours(allocation.hours)} · arrasta para mover`}><button type="button" className="team-allocation-remove" aria-label={`Remover ${allocationText(allocation)}`} title="Remover da alocação" onClick={(event) => { event.stopPropagation(); removeAllocation(allocation.id); }}>×</button><strong>{issue?.project ?? allocation.customTitle}</strong>{issue && (issue.webUrl ? <a href={issue.webUrl} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>#{issue.iid} {issue.title}</a> : <span>#{issue.iid} {issue.title}</span>)}{!issue && <span>{TEAM_ABSENCE_TYPES[allocation.absenceType ?? "other"].label} · sem cliente/US</span>}<small>{formatHours(allocation.hours)}</small></div>;
+                    const fromTimeline = Boolean(allocation.timelineTaskId);
+                    return <div key={allocation.id} role="button" tabIndex={0} draggable={!fromTimeline} className={`team-allocation-block ${fromTimeline ? "timeline-derived" : ""} ${draggedAllocationId === allocation.id ? "dragging" : ""} ${!issue && !fromTimeline ? `absence absence-${allocation.absenceType ?? "other"}` : ""} ${selectedAllocationId === allocation.id ? "selected" : ""}`} style={{ gridColumn: `${allocation.startSlot + 2} / span ${allocation.hours}`, borderColor: issue?.color ?? allocation.customColor ?? "#8b91a7", background: `${issue?.color ?? allocation.customColor ?? "#8b91a7"}20` }} onDragStart={(event) => { if (fromTimeline) { event.preventDefault(); return; } event.dataTransfer.setData("application/x-work-organizer-allocation", allocation.id); event.dataTransfer.effectAllowed = "move"; setDraggedAllocationId(allocation.id); }} onDragEnd={() => { setDraggedAllocationId(null); setDropPreview(null); }} onClick={() => fromTimeline ? setToast("Este bloco vem da Timeline. Altera-o no menu Timeline.") : setSelectedAllocationId(allocation.id)} onKeyDown={(event) => { if ((event.key === "Enter" || event.key === " ") && fromTimeline) setToast("Este bloco vem da Timeline. Altera-o no menu Timeline."); else if (event.key === "Enter" || event.key === " ") setSelectedAllocationId(allocation.id); if (!fromTimeline && (event.key === "Delete" || event.key === "Backspace")) removeAllocation(allocation.id); }} title={`${allocationText(allocation)} · ${formatHours(allocationHours(allocation))}${fromTimeline ? " · preenchido pela Timeline" : " · arrasta para mover"}`}>{!fromTimeline && <button type="button" className="team-allocation-remove" aria-label={`Remover ${allocationText(allocation)}`} title="Remover da alocação" onClick={(event) => { event.stopPropagation(); removeAllocation(allocation.id); }}>×</button>}<strong>{issue?.project ?? allocation.customTitle}</strong>{fromTimeline ? allocation.timelineWebUrl ? <a href={allocation.timelineWebUrl} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>{allocation.timelineTitle}</a> : <span>{allocation.timelineTitle}</span> : issue && (issue.webUrl ? <a href={issue.webUrl} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>#{issue.iid} {issue.title}</a> : <span>#{issue.iid} {issue.title}</span>)}{!issue && !fromTimeline && <span>{TEAM_ABSENCE_TYPES[allocation.absenceType ?? "other"].label} · sem cliente/US</span>}<small>{formatHours(allocationHours(allocation))}</small></div>;
                   })}
                 </div>
               );
             })}
             {!members.length && <div className="empty-state"><span>＋</span><strong>Adiciona a primeira pessoa da equipa</strong><p>As pessoas formam as linhas da tabela semanal.</p></div>}
           </div>
-          <div className="team-board-legend"><span><i />1 célula = 1 h = 2,5%</span><span>{currentAllocations.length} blocos nesta semana</span><span>{formatHours(currentAllocations.reduce((sum, allocation) => sum + allocation.hours, 0))} alocadas</span></div>
+          <div className="team-board-legend"><span><i />1 célula = 1 h = 2,5%</span><span>{displayedAllocations.length} blocos nesta semana</span><span>{formatHours(displayedAllocations.reduce((sum, allocation) => sum + allocationHours(allocation), 0))} alocadas</span>{timelineAllocations.length > 0 && <span className="timeline-legend"><i />{timelineAllocations.length} da Timeline</span>}</div>
         </section>
       </section>
     </div>
