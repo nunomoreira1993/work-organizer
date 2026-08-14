@@ -172,12 +172,15 @@ type TeamMember = {
   role?: string;
 };
 
+type TeamAbsenceType = "vacation" | "absence" | "training" | "other";
+
 type TeamAllocation = {
   id: string;
   memberId: string;
   issueId?: string;
   customTitle?: string;
   customColor?: string;
+  absenceType?: TeamAbsenceType;
   weekStart: string;
   startSlot: number;
   hours: number;
@@ -5110,6 +5113,7 @@ function MultiSelectFilter({
   placeholder?: string;
 }) {
   const [search, setSearch] = useState("");
+  const detailsRef = useRef<HTMLDetailsElement>(null);
   const needle = search.trim().toLowerCase();
   const visible = options.filter((option) =>
     `${option.label} ${option.meta ?? ""}`.toLowerCase().includes(needle),
@@ -5126,10 +5130,29 @@ function MultiSelectFilter({
     );
   }
 
+  useEffect(() => {
+    function closeOnOutsideClick(event: PointerEvent) {
+      if (!detailsRef.current?.contains(event.target as Node)) {
+        detailsRef.current?.removeAttribute("open");
+      }
+    }
+    function closeOnEscape(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        detailsRef.current?.removeAttribute("open");
+      }
+    }
+    document.addEventListener("pointerdown", closeOnOutsideClick);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsideClick);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, []);
+
   return (
     <label className="multi-filter-label">
       <span>{label}</span>
-      <details className="multi-filter">
+      <details className="multi-filter" ref={detailsRef}>
         <summary title={selectedLabels.join(", ")}>
           <span>
             {values.length === 0
@@ -5141,6 +5164,14 @@ function MultiSelectFilter({
           <b>⌄</b>
         </summary>
         <div className="multi-filter-popover">
+          <button
+            type="button"
+            className="multi-filter-close"
+            aria-label={`Fechar filtro ${label}`}
+            onClick={() => detailsRef.current?.removeAttribute("open")}
+          >
+            ×
+          </button>
           <div className="multi-filter-search">
             <span>⌕</span>
             <input
@@ -5323,6 +5354,12 @@ function IssuesView({ issues, tasks }: { issues: IssueRecord[]; tasks: Task[] })
 }
 
 const TEAM_WEEKDAYS = ["2ª Feira", "3ª Feira", "4ª Feira", "5ª Feira", "6ª Feira"];
+const TEAM_ABSENCE_TYPES: Record<TeamAbsenceType, { label: string; color: string }> = {
+  vacation: { label: "Férias", color: "#d88a24" },
+  absence: { label: "Ausência", color: "#d05260" },
+  training: { label: "Formação", color: "#278b78" },
+  other: { label: "Outro", color: "#778092" },
+};
 
 function teamWeekLabel(weekStart: string) {
   const end = addDays(weekStart, 4);
@@ -5368,7 +5405,17 @@ function TeamAllocationView({
   const [selectedAllocationId, setSelectedAllocationId] = useState<string | null>(null);
   const [newMemberName, setNewMemberName] = useState("");
   const [customTitle, setCustomTitle] = useState("");
+  const [absenceType, setAbsenceType] = useState<TeamAbsenceType>("vacation");
+  const [absenceMemberId, setAbsenceMemberId] = useState(() => members[0]?.id ?? "");
+  const [absenceDay, setAbsenceDay] = useState(0);
+  const [absenceStartHour, setAbsenceStartHour] = useState(0);
   const [customHours, setCustomHours] = useState(8);
+
+  useEffect(() => {
+    if (!members.some((member) => member.id === absenceMemberId)) {
+      setAbsenceMemberId(members[0]?.id ?? "");
+    }
+  }, [absenceMemberId, members]);
 
   const issueById = useMemo(
     () => new Map(issues.map((issue) => [issue.id, issue])),
@@ -5484,31 +5531,33 @@ function TeamAllocationView({
   }
 
   function addCustomAllocation() {
-    const title = customTitle.trim();
-    if (!title || !members[0]) {
-      setToast("Indica o nome do bloco e adiciona pelo menos uma pessoa.");
+    const member = members.find((item) => item.id === absenceMemberId);
+    const typeConfig = TEAM_ABSENCE_TYPES[absenceType];
+    const title = customTitle.trim() || typeConfig.label;
+    if (!member) {
+      setToast("Escolhe uma pessoa para registar a ausência.");
       return;
     }
-    const hours = Math.min(40, Math.max(1, Math.round(customHours)));
-    const firstFree = Array.from({ length: 40 }, (_, slot) => slot).find(
-      (slot) => slot + hours <= 40 && !hasCollision(members[0].id, slot, hours),
-    );
-    if (firstFree === undefined) {
-      setToast("A primeira pessoa não tem espaço livre suficiente nesta semana.");
+    const startSlot = absenceDay * 8 + absenceStartHour;
+    const hours = Math.min(40 - startSlot, Math.max(1, Math.round(customHours)));
+    if (hasCollision(member.id, startSlot, hours)) {
+      setToast("Esse período já tem uma alocação. Escolhe outra hora ou ajusta a duração.");
       return;
     }
     const allocation: TeamAllocation = {
       id: crypto.randomUUID(),
-      memberId: members[0].id,
+      memberId: member.id,
       customTitle: title,
-      customColor: "#8b91a7",
+      customColor: typeConfig.color,
+      absenceType,
       weekStart,
-      startSlot: firstFree,
+      startSlot,
       hours,
     };
     setAllocations((current) => [...current, allocation]);
     setSelectedAllocationId(allocation.id);
     setCustomTitle("");
+    setToast(`${typeConfig.label} registada para ${member.name}.`);
   }
 
   function updateAllocation(
@@ -5709,10 +5758,14 @@ function TeamAllocationView({
             {!filteredIssues.length && <div className="empty-state compact"><span>⌕</span><strong>Sem US para estes filtros</strong></div>}
           </div>
           <div className="custom-allocation-form">
-            <strong>Ausência ou outro bloco</strong>
-            <input value={customTitle} onChange={(event) => setCustomTitle(event.target.value)} placeholder="Ex.: Férias, Formação…" />
+            <strong>Férias e ausências</strong>
+            <label><span>Tipo</span><select value={absenceType} onChange={(event) => setAbsenceType(event.target.value as TeamAbsenceType)}>{Object.entries(TEAM_ABSENCE_TYPES).map(([value, config]) => <option key={value} value={value}>{config.label}</option>)}</select></label>
+            <label><span>Pessoa</span><select value={absenceMemberId} onChange={(event) => setAbsenceMemberId(event.target.value)}><option value="">Escolher…</option>{members.map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select></label>
+            <label><span>Dia</span><select value={absenceDay} onChange={(event) => setAbsenceDay(Number(event.target.value))}>{TEAM_WEEKDAYS.map((day, index) => <option key={day} value={index}>{day}</option>)}</select></label>
+            <label><span>Início</span><select value={absenceStartHour} onChange={(event) => setAbsenceStartHour(Number(event.target.value))}>{Array.from({ length: 8 }, (_, index) => <option key={index} value={index}>Hora {index + 1}</option>)}</select></label>
             <label><span>Horas</span><input type="number" min="1" max="40" value={customHours} onChange={(event) => setCustomHours(Number(event.target.value) || 1)} /></label>
-            <button className="secondary-button" onClick={addCustomAllocation}>Adicionar bloco</button>
+            <label className="custom-allocation-note"><span>Nota opcional</span><input value={customTitle} onChange={(event) => setCustomTitle(event.target.value)} placeholder={TEAM_ABSENCE_TYPES[absenceType].label} /></label>
+            <button className="secondary-button" onClick={addCustomAllocation}>Adicionar à semana</button>
           </div>
         </aside>
 
@@ -5752,7 +5805,7 @@ function TeamAllocationView({
                   {Array.from({ length: 40 }, (_, slot) => <button key={slot} className={`team-drop-cell ${(slot + 1) % 8 === 0 ? "day-end" : ""}`} aria-label={`${member.name}, ${TEAM_WEEKDAYS[Math.floor(slot / 8)]}, hora ${(slot % 8) + 1}`} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "copy"; }} onDrop={(event) => { event.preventDefault(); const issueId = event.dataTransfer.getData("application/x-work-organizer-issue") || draggedIssueId; if (issueId) addAllocation(member.id, slot, issueId); }} />)}
                   {memberAllocations.map((allocation) => {
                     const issue = allocation.issueId ? issueById.get(allocation.issueId) : null;
-                    return <div key={allocation.id} role="button" tabIndex={0} className={`team-allocation-block ${selectedAllocationId === allocation.id ? "selected" : ""}`} style={{ gridColumn: `${allocation.startSlot + 2} / span ${allocation.hours}`, borderColor: issue?.color ?? allocation.customColor ?? "#8b91a7", background: `${issue?.color ?? allocation.customColor ?? "#8b91a7"}20` }} onClick={() => setSelectedAllocationId(allocation.id)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") setSelectedAllocationId(allocation.id); }} title={`${allocationText(allocation)} · ${formatHours(allocation.hours)}`}><strong>{issue?.project ?? allocation.customTitle}</strong>{issue && (issue.webUrl ? <a href={issue.webUrl} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>#{issue.iid} {issue.title}</a> : <span>#{issue.iid} {issue.title}</span>)}<small>{formatHours(allocation.hours)}</small></div>;
+                    return <div key={allocation.id} role="button" tabIndex={0} className={`team-allocation-block ${!issue ? `absence absence-${allocation.absenceType ?? "other"}` : ""} ${selectedAllocationId === allocation.id ? "selected" : ""}`} style={{ gridColumn: `${allocation.startSlot + 2} / span ${allocation.hours}`, borderColor: issue?.color ?? allocation.customColor ?? "#8b91a7", background: `${issue?.color ?? allocation.customColor ?? "#8b91a7"}20` }} onClick={() => setSelectedAllocationId(allocation.id)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") setSelectedAllocationId(allocation.id); }} title={`${allocationText(allocation)} · ${formatHours(allocation.hours)}`}><strong>{issue?.project ?? allocation.customTitle}</strong>{issue && (issue.webUrl ? <a href={issue.webUrl} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>#{issue.iid} {issue.title}</a> : <span>#{issue.iid} {issue.title}</span>)}{!issue && <span>{TEAM_ABSENCE_TYPES[allocation.absenceType ?? "other"].label} · sem cliente/US</span>}<small>{formatHours(allocation.hours)}</small></div>;
                   })}
                 </div>
               );
