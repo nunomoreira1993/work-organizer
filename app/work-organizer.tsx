@@ -5362,12 +5362,34 @@ function IssuesView({ issues, tasks }: { issues: IssueRecord[]; tasks: Task[] })
 }
 
 const TEAM_WEEKDAYS = ["2ª Feira", "3ª Feira", "4ª Feira", "5ª Feira", "6ª Feira"];
+const TEAM_SLOT_HOURS = 0.5;
+const TEAM_DAY_HOURS = 8;
+const TEAM_WEEK_HOURS = 40;
+const TEAM_SLOTS_PER_DAY = TEAM_DAY_HOURS / TEAM_SLOT_HOURS;
+const TEAM_WEEK_SLOTS = TEAM_WEEK_HOURS / TEAM_SLOT_HOURS;
 const TEAM_ABSENCE_TYPES: Record<TeamAbsenceType, { label: string; color: string }> = {
   vacation: { label: "Férias", color: "#d88a24" },
   absence: { label: "Ausência", color: "#d05260" },
   training: { label: "Formação", color: "#278b78" },
   other: { label: "Outro", color: "#778092" },
 };
+
+function quantizeTeamHours(value: number) {
+  return Math.ceil(value / TEAM_SLOT_HOURS) * TEAM_SLOT_HOURS;
+}
+
+function teamGridColumn(startSlot: number) {
+  return Math.round(startSlot / TEAM_SLOT_HOURS) + 2;
+}
+
+function teamGridSpan(hours: number) {
+  return Math.max(1, Math.round(hours / TEAM_SLOT_HOURS));
+}
+
+function teamHalfHourLabel(slotIndex: number) {
+  const hour = Math.floor(slotIndex / 2) + 1;
+  return slotIndex % 2 === 0 ? String(hour) : "½";
+}
 
 function teamWeekLabel(weekStart: string) {
   const end = addDays(weekStart, 4);
@@ -5510,30 +5532,42 @@ function TeamAllocationView({
         const issue = issueById.get(task.rootId);
         if (issue && manuallyAllocatedIssues.has(issue.id)) return;
         const dayIndex = weekDates.get(task.date)!;
-        const dayStart = dayIndex * 8;
-        const slots = Math.min(40, Math.max(1, Math.ceil(task.estimate)));
+        const dayStart = dayIndex * TEAM_DAY_HOURS;
+        const duration = Math.min(
+          TEAM_WEEK_HOURS,
+          Math.max(TEAM_SLOT_HOURS, quantizeTeamHours(task.estimate)),
+        );
         const preferred = dayStart + Math.min(
-          7,
-          Math.max(0, Math.floor(task.start - capacity.startHour)),
+          TEAM_DAY_HOURS - TEAM_SLOT_HOURS,
+          Math.max(
+            0,
+            Math.floor((task.start - capacity.startHour) / TEAM_SLOT_HOURS) * TEAM_SLOT_HOURS,
+          ),
         );
         const orderedSlots = [
-          ...Array.from({ length: 40 - preferred }, (_, index) => preferred + index),
-          ...Array.from({ length: preferred }, (_, index) => index),
+          ...Array.from(
+            { length: Math.round((TEAM_WEEK_HOURS - preferred) / TEAM_SLOT_HOURS) },
+            (_, index) => preferred + index * TEAM_SLOT_HOURS,
+          ),
+          ...Array.from(
+            { length: Math.round(preferred / TEAM_SLOT_HOURS) },
+            (_, index) => index * TEAM_SLOT_HOURS,
+          ),
         ];
         const freeSlots = orderedSlots
           .filter((slot) => occupied.every(
             (allocation) =>
-              slot + 1 <= allocation.startSlot ||
+              slot + TEAM_SLOT_HOURS <= allocation.startSlot ||
               slot >= allocation.startSlot + allocation.hours,
           ))
-          .slice(0, slots)
+          .slice(0, Math.round(duration / TEAM_SLOT_HOURS))
           .sort((left, right) => left - right);
-        if (freeSlots.length < slots) return;
+        if (freeSlots.length < Math.round(duration / TEAM_SLOT_HOURS)) return;
         const segments: Array<{ startSlot: number; hours: number }> = [];
         freeSlots.forEach((slot) => {
           const previous = segments[segments.length - 1];
-          if (previous && previous.startSlot + previous.hours === slot) previous.hours += 1;
-          else segments.push({ startSlot: slot, hours: 1 });
+          if (previous && Math.abs(previous.startSlot + previous.hours - slot) < 0.001) previous.hours += TEAM_SLOT_HOURS;
+          else segments.push({ startSlot: slot, hours: TEAM_SLOT_HOURS });
         });
         occupied.push(...segments);
         result.push({
@@ -5544,7 +5578,7 @@ function TeamAllocationView({
           customColor: task.color || (task.source === "outlook" ? "#3977d5" : "#625df2"),
           weekStart,
           startSlot: segments[0].startSlot,
-          hours: slots,
+          hours: duration,
           segments,
           timelineTaskId: task.id,
           timelineTitle: task.title,
@@ -5622,7 +5656,10 @@ function TeamAllocationView({
   );
 
   function defaultHours(issue: IssueRecord) {
-    return Math.min(40, Math.max(1, Math.round(issue.estimateTotal || 1)));
+    return Math.min(
+      TEAM_WEEK_HOURS,
+      Math.max(TEAM_SLOT_HOURS, quantizeTeamHours(issue.estimateTotal || 1)),
+    );
   }
 
   function segmentsFor(allocation: TeamAllocation) {
@@ -5651,10 +5688,16 @@ function TeamAllocationView({
   }
 
   function normalizePlacement(startSlot: number, requestedHours: number) {
-    const safeStart = Math.min(39, Math.max(0, Math.round(startSlot)));
-    const hours = Math.min(40, Math.max(1, Math.round(requestedHours)));
+    const safeStart = Math.min(
+      TEAM_WEEK_HOURS - TEAM_SLOT_HOURS,
+      Math.max(0, Math.round(startSlot / TEAM_SLOT_HOURS) * TEAM_SLOT_HOURS),
+    );
+    const hours = Math.min(
+      TEAM_WEEK_HOURS,
+      Math.max(TEAM_SLOT_HOURS, quantizeTeamHours(requestedHours)),
+    );
     return {
-      startSlot: Math.min(safeStart, 40 - hours),
+      startSlot: Math.min(safeStart, TEAM_WEEK_HOURS - hours),
       hours,
     };
   }
@@ -5672,21 +5715,27 @@ function TeamAllocationView({
     }
     if (allowSplit) {
       const orderedSlots = [
-        ...Array.from({ length: 40 - preferred.startSlot }, (_, index) => preferred.startSlot + index),
-        ...Array.from({ length: preferred.startSlot }, (_, index) => index),
+        ...Array.from(
+          { length: Math.round((TEAM_WEEK_HOURS - preferred.startSlot) / TEAM_SLOT_HOURS) },
+          (_, index) => preferred.startSlot + index * TEAM_SLOT_HOURS,
+        ),
+        ...Array.from(
+          { length: Math.round(preferred.startSlot / TEAM_SLOT_HOURS) },
+          (_, index) => index * TEAM_SLOT_HOURS,
+        ),
       ];
       const freeSlots = orderedSlots
-        .filter((slot) => !hasCollision(memberId, slot, 1, ignoreId))
-        .slice(0, preferred.hours)
+        .filter((slot) => !hasCollision(memberId, slot, TEAM_SLOT_HOURS, ignoreId))
+        .slice(0, Math.round(preferred.hours / TEAM_SLOT_HOURS))
         .sort((left, right) => left - right);
-      if (freeSlots.length < preferred.hours) return null;
+      if (freeSlots.length < Math.round(preferred.hours / TEAM_SLOT_HOURS)) return null;
       const segments: Array<{ startSlot: number; hours: number }> = [];
       freeSlots.forEach((slot) => {
         const previous = segments[segments.length - 1];
         if (previous && previous.startSlot + previous.hours === slot) {
-          previous.hours += 1;
+          previous.hours += TEAM_SLOT_HOURS;
         } else {
-          segments.push({ startSlot: slot, hours: 1 });
+          segments.push({ startSlot: slot, hours: TEAM_SLOT_HOURS });
         }
       });
       return {
@@ -5696,8 +5745,8 @@ function TeamAllocationView({
       };
     }
     const candidates = Array.from(
-      { length: 41 - preferred.hours },
-      (_, startSlot) => startSlot,
+      { length: Math.round((TEAM_WEEK_HOURS - preferred.hours) / TEAM_SLOT_HOURS) + 1 },
+      (_, index) => index * TEAM_SLOT_HOURS,
     ).sort((left, right) => {
       const distance = Math.abs(left - preferred.startSlot) - Math.abs(right - preferred.startSlot);
       return distance || left - right;
@@ -5728,7 +5777,7 @@ function TeamAllocationView({
     );
     const next = placement
       ? { memberId, ...placement, valid: true }
-      : { memberId, startSlot: hoveredSlot, hours: 1, valid: false, segments: [{ startSlot: hoveredSlot, hours: 1 }] };
+      : { memberId, startSlot: hoveredSlot, hours: TEAM_SLOT_HOURS, valid: false, segments: [{ startSlot: hoveredSlot, hours: TEAM_SLOT_HOURS }] };
     setDropPreview((current) =>
       current &&
       current.memberId === next.memberId &&
@@ -5774,7 +5823,7 @@ function TeamAllocationView({
     }
     const placement = findAvailablePlacement(
       member.id,
-      absenceDay * 8 + absenceStartHour,
+      absenceDay * TEAM_DAY_HOURS + absenceStartHour,
       customHours,
       undefined,
       false,
@@ -5886,11 +5935,11 @@ function TeamAllocationView({
 
   function buildEmailTable() {
     const border = "#dfe2e8";
-    const percentRow = Array.from({ length: 40 }, () => `<th style="width:30px;height:24px;padding:0;text-align:center;color:#8d94a2;border-right:1px solid #eceef2;border-bottom:1px solid ${border};font-size:9px;font-weight:400">2.5%</th>`).join("");
-    const hourRow = Array.from({ length: 40 }, (_, index) => `<th style="height:28px;padding:0;text-align:center;color:#5b6371;border-right:1px solid #eceef2;border-bottom:1px solid ${border};font-size:10px">${(index % 8) + 1}</th>`).join("");
-    const dayRow = TEAM_WEEKDAYS.map((day, index) => `<th colspan="8" style="height:38px;padding:0 9px;text-align:left;color:#4c5463;border-right:1px solid #cdd1da;border-bottom:1px solid ${border};background:#f5f6f9;font-size:11px">${day}<span style="float:right;color:#9299a7;font-size:9px;font-weight:400">${escapeHtml(formatDate(addDays(weekStart, index)))}</span></th>`).join("");
+    const percentRow = Array.from({ length: TEAM_WEEK_SLOTS }, () => `<th style="width:15px;height:24px;padding:0;text-align:center;color:#8d94a2;border-right:1px solid #eceef2;border-bottom:1px solid ${border};font-size:7px;font-weight:400">1,25%</th>`).join("");
+    const hourRow = Array.from({ length: TEAM_WEEK_SLOTS }, (_, index) => `<th style="height:28px;padding:0;text-align:center;color:#5b6371;border-right:1px solid #eceef2;border-bottom:1px solid ${border};font-size:8px">${teamHalfHourLabel(index % TEAM_SLOTS_PER_DAY)}</th>`).join("");
+    const dayRow = TEAM_WEEKDAYS.map((day, index) => `<th colspan="${TEAM_SLOTS_PER_DAY}" style="height:38px;padding:0 9px;text-align:left;color:#4c5463;border-right:1px solid #cdd1da;border-bottom:1px solid ${border};background:#f5f6f9;font-size:11px">${day}<span style="float:right;color:#9299a7;font-size:9px;font-weight:400">${escapeHtml(formatDate(addDays(weekStart, index)))}</span></th>`).join("");
     const corner = (content: string) => `<th style="width:210px;padding:0 12px;text-align:left;color:#4d5564;border-right:1px solid ${border};border-bottom:1px solid ${border};background:#fafbfc;font-size:10px">${content}</th>`;
-    const columns = `<colgroup><col style="width:210px">${Array.from({ length: 40 }, () => '<col style="width:30px">').join("")}</colgroup>`;
+    const columns = `<colgroup><col style="width:210px">${Array.from({ length: TEAM_WEEK_SLOTS }, () => '<col style="width:15px">').join("")}</colgroup>`;
     const body = members.map((member) => {
       const memberAllocations = displayedAllocations.filter(
         (allocation) => allocation.memberId === member.id,
@@ -5907,11 +5956,11 @@ function TeamAllocationView({
           ),
       );
       const cells: string[] = [];
-      for (let slot = 0; slot < 40;) {
+      for (let slot = 0; slot < TEAM_WEEK_HOURS;) {
         const entry = byStart.get(slot);
         if (!entry) {
           cells.push(`<td style="height:62px;padding:0;border-right:1px solid #eef0f3;border-bottom:1px solid ${border};background:#fff"></td>`);
-          slot += 1;
+          slot += TEAM_SLOT_HOURS;
           continue;
         }
         const { allocation, segment } = entry;
@@ -5928,30 +5977,30 @@ function TeamAllocationView({
           : `<br><span style="color:#747b87;font-size:9px;font-style:italic">${TEAM_ABSENCE_TYPES[allocation.absenceType ?? "other"].label} · sem cliente/US</span>`;
         const color = issue?.color ?? allocation.customColor ?? "#8b91a7";
         const background = allocation.timelineTaskId ? "#eaf2ff" : issue ? `${color}20` : allocation.absenceType === "vacation" ? "#fff0d5" : allocation.absenceType === "absence" ? "#fbe1e4" : allocation.absenceType === "training" ? "#ddf3ed" : "#eceef2";
-        cells.push(`<td colspan="${segment.hours}" style="height:50px;padding:6px 8px;vertical-align:middle;color:#3e4655;border-right:1px solid ${border};border-bottom:1px solid ${border};border-left:4px ${issue && !allocation.timelineTaskId ? "solid" : "dashed"} ${color};background:${background};font-family:Arial,sans-serif"><strong style="display:block;font-size:11px">${escapeHtml(project)}</strong>${issueLine}<span style="float:right;color:#6a65dd;font-size:9px">${formatHours(segment.hours)}${segment.hours !== allocation.hours ? ` / ${formatHours(allocationHours(allocation))}` : ""}</span></td>`);
+        cells.push(`<td colspan="${teamGridSpan(segment.hours)}" style="height:50px;padding:6px 8px;vertical-align:middle;color:#3e4655;border-right:1px solid ${border};border-bottom:1px solid ${border};border-left:4px ${issue && !allocation.timelineTaskId ? "solid" : "dashed"} ${color};background:${background};font-family:Arial,sans-serif"><strong style="display:block;font-size:11px">${escapeHtml(project)}</strong>${issueLine}<span style="float:right;color:#6a65dd;font-size:9px">${formatHours(segment.hours)}${segment.hours !== allocation.hours ? ` / ${formatHours(allocationHours(allocation))}` : ""}</span></td>`);
         slot += segment.hours;
       }
       return `<tr><th style="height:62px;padding:8px 10px;text-align:left;vertical-align:middle;white-space:nowrap;color:#343c4b;border-right:1px solid ${border};border-bottom:1px solid ${border};background:#fff;font-size:11px">${escapeHtml(member.name)}${member.role ? `<br><span style="color:#9198a5;font-size:9px;font-weight:400">${escapeHtml(member.role)}</span>` : ""}<br><span style="color:#6560dc;font-size:9px;font-weight:400">${formatHours(total)} · ${Math.round((total / 40) * 100)}%</span></th>${cells.join("")}</tr>`;
     }).join("");
-    return `<div style="font-family:Arial,sans-serif;color:#343c4b"><div style="margin:0 0 10px"><strong style="font-size:18px">Alocação semanal da equipa</strong><br><span style="color:#7c8492;font-size:11px">${escapeHtml(teamWeekLabel(weekStart))} · 1 célula = 1 h = 2,5%</span></div><table role="presentation" cellspacing="0" cellpadding="0" style="width:1410px;table-layout:fixed;border-collapse:collapse;border:1px solid ${border};font-family:Arial,sans-serif;background:#fff">${columns}<thead><tr>${corner("Pessoa")}${percentRow}</tr><tr>${corner("Semana")}${dayRow}</tr><tr>${corner("Hora")}${hourRow}</tr></thead><tbody>${body}</tbody></table></div>`;
+    return `<div style="font-family:Arial,sans-serif;color:#343c4b"><div style="margin:0 0 10px"><strong style="font-size:18px">Alocação semanal da equipa</strong><br><span style="color:#7c8492;font-size:11px">${escapeHtml(teamWeekLabel(weekStart))} · 1 célula = 0,5 h = 1,25%</span></div><table role="presentation" cellspacing="0" cellpadding="0" style="width:1410px;table-layout:fixed;border-collapse:collapse;border:1px solid ${border};font-family:Arial,sans-serif;background:#fff">${columns}<thead><tr>${corner("Pessoa")}${percentRow}</tr><tr>${corner("Semana")}${dayRow}</tr><tr>${corner("Hora")}${hourRow}</tr></thead><tbody>${body}</tbody></table></div>`;
   }
 
   async function copyForEmail() {
     const html = buildEmailTable();
     const plainRows = members.map((member) => {
-      const slots = Array.from({ length: 40 }, () => "");
+      const slots = Array.from({ length: TEAM_WEEK_SLOTS }, () => "");
       displayedAllocations
         .filter((allocation) => allocation.memberId === member.id)
         .forEach((allocation) => {
           segmentsFor(allocation).forEach((segment) => {
-            slots[segment.startSlot] = allocationText(allocation);
+            slots[Math.round(segment.startSlot / TEAM_SLOT_HOURS)] = allocationText(allocation);
           });
         });
       return [member.name, ...slots].join("\t");
     });
     const plain = [
-      ["", ...Array.from({ length: 40 }, () => "2.5%")].join("\t"),
-      ["", ...Array.from({ length: 40 }, (_, index) => String((index % 8) + 1))].join("\t"),
+      ["", ...Array.from({ length: TEAM_WEEK_SLOTS }, () => "1,25%")].join("\t"),
+      ["", ...Array.from({ length: TEAM_WEEK_SLOTS }, (_, index) => teamHalfHourLabel(index % TEAM_SLOTS_PER_DAY))].join("\t"),
       ...plainRows,
     ].join("\n");
     try {
@@ -5973,24 +6022,24 @@ function TeamAllocationView({
 
   async function copyForExcel() {
     const dayCells = TEAM_WEEKDAYS.flatMap((day) =>
-      Array.from({ length: 8 }, () => day),
+      Array.from({ length: TEAM_SLOTS_PER_DAY }, () => day),
     );
     const rows = members.map((member) => {
-      const slots = Array.from({ length: 40 }, () => "");
+      const slots = Array.from({ length: TEAM_WEEK_SLOTS }, () => "");
       displayedAllocations
         .filter((allocation) => allocation.memberId === member.id)
         .forEach((allocation) => {
           const text = allocationText(allocation);
           segmentsFor(allocation).forEach((segment) => {
-            for (let slot = segment.startSlot; slot < segment.startSlot + segment.hours; slot++) slots[slot] = text;
+            for (let slot = segment.startSlot; slot < segment.startSlot + segment.hours; slot += TEAM_SLOT_HOURS) slots[Math.round(slot / TEAM_SLOT_HOURS)] = text;
           });
         });
       return [member.name, ...slots];
     });
     const tsv = [
-      [teamWeekLabel(weekStart), ...Array.from({ length: 40 }, () => "2.5%")],
+      [teamWeekLabel(weekStart), ...Array.from({ length: TEAM_WEEK_SLOTS }, () => "1,25%")],
       ["Dia", ...dayCells],
-      ["Hora", ...Array.from({ length: 40 }, (_, index) => String((index % 8) + 1))],
+      ["Hora", ...Array.from({ length: TEAM_WEEK_SLOTS }, (_, index) => teamHalfHourLabel(index % TEAM_SLOTS_PER_DAY))],
       ...rows,
     ].map((row) => row.join("\t")).join("\n");
     const html = buildEmailTable();
@@ -6015,17 +6064,17 @@ function TeamAllocationView({
     const header = [
       "Pessoa",
       ...TEAM_WEEKDAYS.flatMap((day) =>
-        Array.from({ length: 8 }, (_, index) => `${day} ${index + 1}`),
+        Array.from({ length: TEAM_SLOTS_PER_DAY }, (_, index) => `${day} ${Math.floor(index / 2) + 1}${index % 2 ? ":30" : ":00"}`),
       ),
     ];
     const rows = members.map((member) => {
-      const slots = Array.from({ length: 40 }, () => "");
+      const slots = Array.from({ length: TEAM_WEEK_SLOTS }, () => "");
       displayedAllocations
         .filter((allocation) => allocation.memberId === member.id)
         .forEach((allocation) => {
           const text = allocationText(allocation);
           segmentsFor(allocation).forEach((segment) => {
-            for (let slot = segment.startSlot; slot < segment.startSlot + segment.hours; slot++) slots[slot] = text;
+            for (let slot = segment.startSlot; slot < segment.startSlot + segment.hours; slot += TEAM_SLOT_HOURS) slots[Math.round(slot / TEAM_SLOT_HOURS)] = text;
           });
         });
       return [member.name, ...slots];
@@ -6045,7 +6094,7 @@ function TeamAllocationView({
       <PageIntro
         eyebrow="CAPACIDADE DA EQUIPA"
         title="Alocação semanal"
-        description="Arrasta US para a grelha de 40 horas. Cada célula representa 1 hora e 2,5% da semana."
+        description="Arrasta US para a grelha de 40 horas. Cada célula representa 30 minutos e 1,25% da semana."
       >
         <div className="team-week-nav">
           <button onClick={() => setWeekStart(addDays(weekStart, -7))}>←</button>
@@ -6091,7 +6140,7 @@ function TeamAllocationView({
                 >
                   <span className="team-issue-color" style={{ background: issue.color }} />
                   <div><small>{issue.client} · {issue.project} · #{issue.iid}</small><strong>{issue.title}</strong><IssueLabels labels={issue.labels} /><IssueAssignees assignees={issue.assignees} compact /></div>
-                  <label onClick={(event) => event.stopPropagation()}><span>Horas</span><input type="number" min="1" max="40" step="1" value={hours} onChange={(event) => setDraftHours((current) => ({ ...current, [issue.id]: Math.min(40, Math.max(1, Number(event.target.value) || 1)) }))} /></label>
+                  <label onClick={(event) => event.stopPropagation()}><span>Horas</span><input type="number" min="0.5" max="40" step="0.5" value={hours} onChange={(event) => setDraftHours((current) => ({ ...current, [issue.id]: Math.min(TEAM_WEEK_HOURS, Math.max(TEAM_SLOT_HOURS, quantizeTeamHours(Number(event.target.value) || TEAM_SLOT_HOURS))) }))} /></label>
                   <small className="team-allocated-note"><b>{allocationState === "fully-allocated" ? "✓ Totalmente alocada" : allocationState === "partially-allocated" ? "◐ Parcialmente alocada" : "○ Ainda não alocada"}</b><span>{formatHours(allocated)} nesta semana{issue.estimateTotal > 0 ? ` / ${formatHours(issue.estimateTotal)}` : ""}</span></small>
                 </article>
               );
@@ -6103,8 +6152,8 @@ function TeamAllocationView({
             <label><span>Tipo</span><select value={absenceType} onChange={(event) => setAbsenceType(event.target.value as TeamAbsenceType)}>{Object.entries(TEAM_ABSENCE_TYPES).map(([value, config]) => <option key={value} value={value}>{config.label}</option>)}</select></label>
             <label><span>Pessoa</span><select value={absenceMemberId} onChange={(event) => setAbsenceMemberId(event.target.value)}><option value="">Escolher…</option>{members.map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select></label>
             <label><span>Dia</span><select value={absenceDay} onChange={(event) => setAbsenceDay(Number(event.target.value))}>{TEAM_WEEKDAYS.map((day, index) => <option key={day} value={index}>{day}</option>)}</select></label>
-            <label><span>Início</span><select value={absenceStartHour} onChange={(event) => setAbsenceStartHour(Number(event.target.value))}>{Array.from({ length: 8 }, (_, index) => <option key={index} value={index}>Hora {index + 1}</option>)}</select></label>
-            <label><span>Horas</span><input type="number" min="1" max="40" value={customHours} onChange={(event) => setCustomHours(Number(event.target.value) || 1)} /></label>
+            <label><span>Início</span><select value={absenceStartHour} onChange={(event) => setAbsenceStartHour(Number(event.target.value))}>{Array.from({ length: TEAM_SLOTS_PER_DAY }, (_, index) => <option key={index} value={index * TEAM_SLOT_HOURS}>{Math.floor(index / 2) + 1}{index % 2 ? ":30" : ":00"}</option>)}</select></label>
+            <label><span>Horas</span><input type="number" min="0.5" max="40" step="0.5" value={customHours} onChange={(event) => setCustomHours(Math.max(TEAM_SLOT_HOURS, quantizeTeamHours(Number(event.target.value) || TEAM_SLOT_HOURS)))} /></label>
             <label className="custom-allocation-note"><span>Nota opcional</span><input value={customTitle} onChange={(event) => setCustomTitle(event.target.value)} placeholder={TEAM_ABSENCE_TYPES[absenceType].label} /></label>
             <button className="secondary-button" onClick={addCustomAllocation}>Adicionar à semana</button>
           </div>
@@ -6120,9 +6169,9 @@ function TeamAllocationView({
             <div className="team-allocation-editor">
               <strong>{allocationText(selectedAllocation)}</strong>
               <label><span>Pessoa</span><select value={selectedAllocation.memberId} onChange={(event) => updateAllocation(selectedAllocation.id, { memberId: event.target.value })}>{members.map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select></label>
-              <label><span>Dia</span><select value={Math.floor(selectedAllocation.startSlot / 8)} onChange={(event) => updateAllocation(selectedAllocation.id, { startSlot: Number(event.target.value) * 8 + (selectedAllocation.startSlot % 8) })}>{TEAM_WEEKDAYS.map((day, index) => <option key={day} value={index}>{day}</option>)}</select></label>
-              <label><span>Hora</span><select value={selectedAllocation.startSlot % 8} onChange={(event) => updateAllocation(selectedAllocation.id, { startSlot: Math.floor(selectedAllocation.startSlot / 8) * 8 + Number(event.target.value) })}>{Array.from({ length: 8 }, (_, index) => <option key={index} value={index}>{index + 1}</option>)}</select></label>
-              <label><span>Horas</span><input type="number" min="1" max={40 - selectedAllocation.startSlot} value={selectedAllocation.hours} onChange={(event) => updateAllocation(selectedAllocation.id, { hours: Number(event.target.value) || 1 })} /></label>
+              <label><span>Dia</span><select value={Math.floor(selectedAllocation.startSlot / TEAM_DAY_HOURS)} onChange={(event) => updateAllocation(selectedAllocation.id, { startSlot: Number(event.target.value) * TEAM_DAY_HOURS + (selectedAllocation.startSlot % TEAM_DAY_HOURS) })}>{TEAM_WEEKDAYS.map((day, index) => <option key={day} value={index}>{day}</option>)}</select></label>
+              <label><span>Hora</span><select value={selectedAllocation.startSlot % TEAM_DAY_HOURS} onChange={(event) => updateAllocation(selectedAllocation.id, { startSlot: Math.floor(selectedAllocation.startSlot / TEAM_DAY_HOURS) * TEAM_DAY_HOURS + Number(event.target.value) })}>{Array.from({ length: TEAM_SLOTS_PER_DAY }, (_, index) => <option key={index} value={index * TEAM_SLOT_HOURS}>{Math.floor(index / 2) + 1}{index % 2 ? ":30" : ":00"}</option>)}</select></label>
+              <label><span>Horas</span><input type="number" min="0.5" step="0.5" max={TEAM_WEEK_HOURS} value={selectedAllocation.hours} onChange={(event) => updateAllocation(selectedAllocation.id, { hours: Number(event.target.value) || TEAM_SLOT_HOURS })} /></label>
               <button className="danger-button" onClick={() => removeAllocation(selectedAllocation.id)}>Remover</button>
               <button className="icon-button" aria-label="Fechar editor" onClick={() => setSelectedAllocationId(null)}>×</button>
             </div>
@@ -6131,11 +6180,11 @@ function TeamAllocationView({
           <div className="team-board-scroll">
             <div className="team-hours-grid team-grid-header">
               <div className="team-grid-corner" style={{ gridRow: 1 }}><strong>Pessoa</strong><small>40 h semanais</small></div>
-              {Array.from({ length: 40 }, (_, slot) => <div key={`percent-${slot}`} className={`team-percent-cell ${(slot + 1) % 8 === 0 ? "day-end" : ""}`}>2.5%</div>)}
+              {Array.from({ length: 40 }, (_, hourSlot) => <div key={`percent-${hourSlot}`} style={{ gridColumn: `${hourSlot * 2 + 2} / span 2` }} className={`team-percent-cell ${(hourSlot + 1) % TEAM_DAY_HOURS === 0 ? "day-end" : ""}`}>2,5%</div>)}
               <div className="team-grid-corner secondary" style={{ gridRow: 2 }}><span>Semana</span></div>
-              {TEAM_WEEKDAYS.map((day, dayIndex) => <div key={day} className="team-day-cell" style={{ gridColumn: `${dayIndex * 8 + 2} / span 8`, gridRow: 2 }}><strong>{day}</strong><small>{formatDate(addDays(weekStart, dayIndex))}</small></div>)}
+              {TEAM_WEEKDAYS.map((day, dayIndex) => <div key={day} className="team-day-cell" style={{ gridColumn: `${dayIndex * TEAM_SLOTS_PER_DAY + 2} / span ${TEAM_SLOTS_PER_DAY}`, gridRow: 2 }}><strong>{day}</strong><small>{formatDate(addDays(weekStart, dayIndex))}</small></div>)}
               <div className="team-grid-corner secondary" style={{ gridRow: 3 }}><span>Hora</span></div>
-              {Array.from({ length: 40 }, (_, slot) => <div key={`hour-${slot}`} className={`team-hour-cell ${(slot + 1) % 8 === 0 ? "day-end" : ""}`}>{(slot % 8) + 1}</div>)}
+              {Array.from({ length: 40 }, (_, hourSlot) => <div key={`hour-${hourSlot}`} style={{ gridColumn: `${hourSlot * 2 + 2} / span 2` }} className={`team-hour-cell ${(hourSlot + 1) % TEAM_DAY_HOURS === 0 ? "day-end" : ""}`}>{(hourSlot % TEAM_DAY_HOURS) + 1}</div>)}
             </div>
             {members.map((member) => {
               const memberAllocations = displayedAllocations.filter((allocation) => allocation.memberId === member.id);
@@ -6143,23 +6192,24 @@ function TeamAllocationView({
               return (
                 <div className="team-hours-grid team-member-row" key={member.id}>
                   <div className="team-member-cell"><div><strong>{member.name}</strong>{member.role && <small>{member.role}</small>}<span>{formatHours(total)} · {Math.round((total / 40) * 100)}%</span></div><button aria-label={`Remover ${member.name}`} onClick={() => removeMember(member)}>×</button></div>
-                  {Array.from({ length: 40 }, (_, slot) => {
-                    const isPreview = dropPreview?.memberId === member.id && dropPreview.segments.some((segment) => slot >= segment.startSlot && slot < segment.startSlot + segment.hours);
-                    return <button key={slot} style={{ gridColumn: slot + 2 }} className={`team-drop-cell ${(slot + 1) % 8 === 0 ? "day-end" : ""} ${isPreview ? dropPreview.valid ? "drop-preview" : "drop-preview-invalid" : ""} ${isPreview && slot === dropPreview.startSlot ? "drop-preview-start" : ""}`} aria-label={`${member.name}, ${TEAM_WEEKDAYS[Math.floor(slot / 8)]}, hora ${(slot % 8) + 1}`} onDragEnter={(event) => { event.preventDefault(); previewDrop(member.id, slot); }} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = draggedAllocationId ? "move" : "copy"; previewDrop(member.id, slot); }} onDrop={(event) => { event.preventDefault(); setDropPreview(null); const allocationId = event.dataTransfer.getData("application/x-work-organizer-allocation") || draggedAllocationId; if (allocationId) { moveAllocation(allocationId, member.id, slot); return; } const issueId = event.dataTransfer.getData("application/x-work-organizer-issue") || draggedIssueId; if (issueId) addAllocation(member.id, slot, issueId); }} />;
+                  {Array.from({ length: TEAM_WEEK_SLOTS }, (_, slot) => {
+                    const logicalSlot = slot * TEAM_SLOT_HOURS;
+                    const isPreview = dropPreview?.memberId === member.id && dropPreview.segments.some((segment) => logicalSlot >= segment.startSlot && logicalSlot < segment.startSlot + segment.hours);
+                    return <button key={slot} style={{ gridColumn: slot + 2 }} className={`team-drop-cell ${(slot + 1) % TEAM_SLOTS_PER_DAY === 0 ? "day-end" : ""} ${(slot + 1) % 2 === 0 ? "hour-end" : ""} ${isPreview ? dropPreview.valid ? "drop-preview" : "drop-preview-invalid" : ""} ${isPreview && logicalSlot === dropPreview.startSlot ? "drop-preview-start" : ""}`} aria-label={`${member.name}, ${TEAM_WEEKDAYS[Math.floor(slot / TEAM_SLOTS_PER_DAY)]}, hora ${Math.floor((slot % TEAM_SLOTS_PER_DAY) / 2) + 1}${slot % 2 ? ":30" : ":00"}`} onDragEnter={(event) => { event.preventDefault(); previewDrop(member.id, logicalSlot); }} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = draggedAllocationId ? "move" : "copy"; previewDrop(member.id, logicalSlot); }} onDrop={(event) => { event.preventDefault(); setDropPreview(null); const allocationId = event.dataTransfer.getData("application/x-work-organizer-allocation") || draggedAllocationId; if (allocationId) { moveAllocation(allocationId, member.id, logicalSlot); return; } const issueId = event.dataTransfer.getData("application/x-work-organizer-issue") || draggedIssueId; if (issueId) addAllocation(member.id, logicalSlot, issueId); }} />;
                   })}
-                  {[7, 15, 23, 31].map((slot) => <div key={`divider-${slot}`} className="team-member-day-divider" style={{ gridColumn: slot + 2 }} />)}
+                  {[15, 31, 47, 63].map((slot) => <div key={`divider-${slot}`} className="team-member-day-divider" style={{ gridColumn: slot + 2 }} />)}
                   {memberAllocations.map((allocation) => {
                     const issue = allocation.issueId ? issueById.get(allocation.issueId) : null;
                     const fromTimeline = Boolean(allocation.timelineTaskId);
                     const segments = segmentsFor(allocation);
-                    return segments.map((segment, segmentIndex) => <div key={`${allocation.id}-${segmentIndex}`} role="button" tabIndex={segmentIndex === 0 ? 0 : -1} draggable={!fromTimeline} className={`team-allocation-block ${segments.length > 1 ? "split-allocation" : ""} ${fromTimeline ? "timeline-derived" : ""} ${draggedAllocationId === allocation.id ? "dragging" : ""} ${!issue && !fromTimeline ? `absence absence-${allocation.absenceType ?? "other"}` : ""} ${selectedAllocationId === allocation.id ? "selected" : ""}`} style={{ gridColumn: `${segment.startSlot + 2} / span ${segment.hours}`, borderColor: issue?.color ?? allocation.customColor ?? "#8b91a7", background: `${issue?.color ?? allocation.customColor ?? "#8b91a7"}20` }} onDragStart={(event) => { if (fromTimeline) { event.preventDefault(); return; } event.dataTransfer.setData("application/x-work-organizer-allocation", allocation.id); event.dataTransfer.effectAllowed = "move"; setDraggedAllocationId(allocation.id); }} onDragEnd={() => { setDraggedAllocationId(null); setDropPreview(null); }} onClick={() => fromTimeline ? setToast("Este bloco vem da Timeline. Altera-o no menu Timeline.") : setSelectedAllocationId(allocation.id)} onKeyDown={(event) => { if ((event.key === "Enter" || event.key === " ") && fromTimeline) setToast("Este bloco vem da Timeline. Altera-o no menu Timeline."); else if (event.key === "Enter" || event.key === " ") setSelectedAllocationId(allocation.id); if (!fromTimeline && (event.key === "Delete" || event.key === "Backspace")) removeAllocation(allocation.id); }} title={`${allocationText(allocation)} · segmento ${formatHours(segment.hours)} de ${formatHours(allocationHours(allocation))}${fromTimeline ? " · preenchido pela Timeline" : " · arrasta para mover"}`}>{!fromTimeline && <button type="button" className="team-allocation-remove" aria-label={`Remover ${allocationText(allocation)}`} title="Remover toda a alocação" onClick={(event) => { event.stopPropagation(); removeAllocation(allocation.id); }}>×</button>}<strong>{issue?.project ?? allocation.customTitle}</strong>{fromTimeline ? allocation.timelineWebUrl ? <a href={allocation.timelineWebUrl} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>{allocation.timelineTitle}</a> : <span>{allocation.timelineTitle}</span> : issue && (issue.webUrl ? <a href={issue.webUrl} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>#{issue.iid} {issue.title}</a> : <span>#{issue.iid} {issue.title}</span>)}{!issue && !fromTimeline && <span>{TEAM_ABSENCE_TYPES[allocation.absenceType ?? "other"].label} · sem cliente/US</span>}<small>{formatHours(segment.hours)}{segments.length > 1 && ` / ${formatHours(allocationHours(allocation))}`}</small></div>);
+                    return segments.map((segment, segmentIndex) => <div key={`${allocation.id}-${segmentIndex}`} role="button" tabIndex={segmentIndex === 0 ? 0 : -1} draggable={!fromTimeline} className={`team-allocation-block ${segments.length > 1 ? "split-allocation" : ""} ${fromTimeline ? "timeline-derived" : ""} ${draggedAllocationId === allocation.id ? "dragging" : ""} ${!issue && !fromTimeline ? `absence absence-${allocation.absenceType ?? "other"}` : ""} ${selectedAllocationId === allocation.id ? "selected" : ""}`} style={{ gridColumn: `${teamGridColumn(segment.startSlot)} / span ${teamGridSpan(segment.hours)}`, borderColor: issue?.color ?? allocation.customColor ?? "#8b91a7", background: `${issue?.color ?? allocation.customColor ?? "#8b91a7"}20` }} onDragStart={(event) => { if (fromTimeline) { event.preventDefault(); return; } event.dataTransfer.setData("application/x-work-organizer-allocation", allocation.id); event.dataTransfer.effectAllowed = "move"; setDraggedAllocationId(allocation.id); }} onDragEnd={() => { setDraggedAllocationId(null); setDropPreview(null); }} onClick={() => fromTimeline ? setToast("Este bloco vem da Timeline. Altera-o no menu Timeline.") : setSelectedAllocationId(allocation.id)} onKeyDown={(event) => { if ((event.key === "Enter" || event.key === " ") && fromTimeline) setToast("Este bloco vem da Timeline. Altera-o no menu Timeline."); else if (event.key === "Enter" || event.key === " ") setSelectedAllocationId(allocation.id); if (!fromTimeline && (event.key === "Delete" || event.key === "Backspace")) removeAllocation(allocation.id); }} title={`${allocationText(allocation)} · segmento ${formatHours(segment.hours)} de ${formatHours(allocationHours(allocation))}${fromTimeline ? " · preenchido pela Timeline" : " · arrasta para mover"}`}>{!fromTimeline && <button type="button" className="team-allocation-remove" aria-label={`Remover ${allocationText(allocation)}`} title="Remover toda a alocação" onClick={(event) => { event.stopPropagation(); removeAllocation(allocation.id); }}>×</button>}<strong>{issue?.project ?? allocation.customTitle}</strong>{fromTimeline ? allocation.timelineWebUrl ? <a href={allocation.timelineWebUrl} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>{allocation.timelineTitle}</a> : <span>{allocation.timelineTitle}</span> : issue && (issue.webUrl ? <a href={issue.webUrl} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>#{issue.iid} {issue.title}</a> : <span>#{issue.iid} {issue.title}</span>)}{!issue && !fromTimeline && <span>{TEAM_ABSENCE_TYPES[allocation.absenceType ?? "other"].label} · sem cliente/US</span>}<small>{formatHours(segment.hours)}{segments.length > 1 && ` / ${formatHours(allocationHours(allocation))}`}</small></div>);
                   })}
                 </div>
               );
             })}
             {!members.length && <div className="empty-state"><span>＋</span><strong>Adiciona a primeira pessoa da equipa</strong><p>As pessoas formam as linhas da tabela semanal.</p></div>}
           </div>
-          <div className="team-board-legend"><span><i />1 célula = 1 h = 2,5%</span><span>{displayedAllocations.length} blocos nesta semana</span><span>{formatHours(displayedAllocations.reduce((sum, allocation) => sum + allocationHours(allocation), 0))} alocadas</span>{timelineAllocations.length > 0 && <span className="timeline-legend"><i />{timelineAllocations.length} da Timeline</span>}</div>
+          <div className="team-board-legend"><span><i />1 célula = 0,5 h = 1,25%</span><span>{displayedAllocations.length} blocos nesta semana</span><span>{formatHours(displayedAllocations.reduce((sum, allocation) => sum + allocationHours(allocation), 0))} alocadas</span>{timelineAllocations.length > 0 && <span className="timeline-legend"><i />{timelineAllocations.length} da Timeline</span>}</div>
         </section>
       </section>
     </div>
