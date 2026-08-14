@@ -4442,6 +4442,7 @@ button:disabled {
 }
 .team-allocation-block:active { cursor: grabbing; }
 .team-allocation-block.dragging { opacity: 0.4; }
+.team-allocation-block.split-allocation { border-style: dashed; }
 .team-allocation-block.timeline-derived {
   border-style: dashed;
   background: repeating-linear-gradient(135deg, #edf4ff, #edf4ff 7px, #e2edff 7px, #e2edff 14px) !important;

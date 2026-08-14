@@ -188,6 +188,7 @@ type TeamAllocation = {
   timelineTitle?: string;
   timelineWebUrl?: string;
   actualHours?: number;
+  segments?: Array<{ startSlot: number; hours: number }>;
 };
 
 type PersistedState = {
@@ -5421,6 +5422,7 @@ function TeamAllocationView({
     startSlot: number;
     hours: number;
     valid: boolean;
+    segments: Array<{ startSlot: number; hours: number }>;
   } | null>(null);
   const [selectedAllocationId, setSelectedAllocationId] = useState<string | null>(null);
   const [newMemberName, setNewMemberName] = useState("");
@@ -5460,10 +5462,7 @@ function TeamAllocationView({
     );
     const occupied = currentAllocations
       .filter((allocation) => allocation.memberId === ownMember.id)
-      .map((allocation) => ({
-        startSlot: allocation.startSlot,
-        hours: allocation.hours,
-      }));
+      .flatMap((allocation) => segmentsFor(allocation));
     const manuallyAllocatedIssues = new Set(
       currentAllocations
         .filter((allocation) => allocation.memberId === ownMember.id && allocation.issueId)
@@ -5502,30 +5501,41 @@ function TeamAllocationView({
     ];
     const result: TeamAllocation[] = [];
     timelineTasks
-      .sort((left, right) => left.date.localeCompare(right.date) || left.start - right.start)
+      .sort((left, right) =>
+        Number(right.phase === "Reunião") - Number(left.phase === "Reunião") ||
+        left.date.localeCompare(right.date) ||
+        left.start - right.start,
+      )
       .forEach((task) => {
         const issue = issueById.get(task.rootId);
         if (issue && manuallyAllocatedIssues.has(issue.id)) return;
         const dayIndex = weekDates.get(task.date)!;
         const dayStart = dayIndex * 8;
-        const slots = Math.min(8, Math.max(1, Math.ceil(task.estimate)));
+        const slots = Math.min(40, Math.max(1, Math.ceil(task.estimate)));
         const preferred = dayStart + Math.min(
-          8 - slots,
+          7,
           Math.max(0, Math.floor(task.start - capacity.startHour)),
         );
-        const candidates = Array.from(
-          { length: 9 - slots },
-          (_, offset) => dayStart + offset,
-        ).sort((left, right) => Math.abs(left - preferred) - Math.abs(right - preferred));
-        const startSlot = candidates.find((candidate) =>
-          occupied.every(
+        const orderedSlots = [
+          ...Array.from({ length: 40 - preferred }, (_, index) => preferred + index),
+          ...Array.from({ length: preferred }, (_, index) => index),
+        ];
+        const freeSlots = orderedSlots
+          .filter((slot) => occupied.every(
             (allocation) =>
-              candidate + slots <= allocation.startSlot ||
-              candidate >= allocation.startSlot + allocation.hours,
-          ),
-        );
-        if (startSlot === undefined) return;
-        occupied.push({ startSlot, hours: slots });
+              slot + 1 <= allocation.startSlot ||
+              slot >= allocation.startSlot + allocation.hours,
+          ))
+          .slice(0, slots)
+          .sort((left, right) => left - right);
+        if (freeSlots.length < slots) return;
+        const segments: Array<{ startSlot: number; hours: number }> = [];
+        freeSlots.forEach((slot) => {
+          const previous = segments[segments.length - 1];
+          if (previous && previous.startSlot + previous.hours === slot) previous.hours += 1;
+          else segments.push({ startSlot: slot, hours: 1 });
+        });
+        occupied.push(...segments);
         result.push({
           id: `timeline-${task.id}`,
           memberId: ownMember.id,
@@ -5533,8 +5543,9 @@ function TeamAllocationView({
           customTitle: issue?.project ?? task.project ?? (task.source === "outlook" ? "Reuniões" : "Timeline"),
           customColor: task.color || (task.source === "outlook" ? "#3977d5" : "#625df2"),
           weekStart,
-          startSlot,
+          startSlot: segments[0].startSlot,
           hours: slots,
+          segments,
           timelineTaskId: task.id,
           timelineTitle: task.title,
           timelineWebUrl: task.webUrl,
@@ -5614,6 +5625,12 @@ function TeamAllocationView({
     return Math.min(40, Math.max(1, Math.round(issue.estimateTotal || 1)));
   }
 
+  function segmentsFor(allocation: TeamAllocation) {
+    return allocation.segments?.length
+      ? allocation.segments
+      : [{ startSlot: allocation.startSlot, hours: allocation.hours }];
+  }
+
   function hasCollision(
     memberId: string,
     startSlot: number,
@@ -5625,8 +5642,11 @@ function TeamAllocationView({
       (allocation) =>
         allocation.memberId === memberId &&
         allocation.id !== ignoreId &&
-        startSlot < allocation.startSlot + allocation.hours &&
-        end > allocation.startSlot,
+        segmentsFor(allocation).some(
+          (segment) =>
+            startSlot < segment.startSlot + segment.hours &&
+            end > segment.startSlot,
+        ),
     );
   }
 
@@ -5644,10 +5664,36 @@ function TeamAllocationView({
     preferredStart: number,
     requestedHours: number,
     ignoreId?: string,
+    allowSplit = true,
   ) {
     const preferred = normalizePlacement(preferredStart, requestedHours);
     if (!hasCollision(memberId, preferred.startSlot, preferred.hours, ignoreId)) {
-      return preferred;
+      return { ...preferred, segments: [{ ...preferred }] };
+    }
+    if (allowSplit) {
+      const orderedSlots = [
+        ...Array.from({ length: 40 - preferred.startSlot }, (_, index) => preferred.startSlot + index),
+        ...Array.from({ length: preferred.startSlot }, (_, index) => index),
+      ];
+      const freeSlots = orderedSlots
+        .filter((slot) => !hasCollision(memberId, slot, 1, ignoreId))
+        .slice(0, preferred.hours)
+        .sort((left, right) => left - right);
+      if (freeSlots.length < preferred.hours) return null;
+      const segments: Array<{ startSlot: number; hours: number }> = [];
+      freeSlots.forEach((slot) => {
+        const previous = segments[segments.length - 1];
+        if (previous && previous.startSlot + previous.hours === slot) {
+          previous.hours += 1;
+        } else {
+          segments.push({ startSlot: slot, hours: 1 });
+        }
+      });
+      return {
+        startSlot: segments[0].startSlot,
+        hours: preferred.hours,
+        segments,
+      };
     }
     const candidates = Array.from(
       { length: 41 - preferred.hours },
@@ -5661,7 +5707,7 @@ function TeamAllocationView({
     );
     return startSlot === undefined
       ? null
-      : { startSlot, hours: preferred.hours };
+      : { startSlot, hours: preferred.hours, segments: [{ startSlot, hours: preferred.hours }] };
   }
 
   function previewDrop(memberId: string, hoveredSlot: number) {
@@ -5682,12 +5728,13 @@ function TeamAllocationView({
     );
     const next = placement
       ? { memberId, ...placement, valid: true }
-      : { memberId, startSlot: hoveredSlot, hours: 1, valid: false };
+      : { memberId, startSlot: hoveredSlot, hours: 1, valid: false, segments: [{ startSlot: hoveredSlot, hours: 1 }] };
     setDropPreview((current) =>
       current &&
       current.memberId === next.memberId &&
       current.startSlot === next.startSlot &&
       current.hours === next.hours &&
+      JSON.stringify(current.segments) === JSON.stringify(next.segments) &&
       current.valid === next.valid
         ? current
         : next,
@@ -5729,6 +5776,8 @@ function TeamAllocationView({
       member.id,
       absenceDay * 8 + absenceStartHour,
       customHours,
+      undefined,
+      false,
     );
     if (!placement) {
       setToast("Essa pessoa não tem espaço livre suficiente para esta ausência na semana.");
@@ -5757,16 +5806,13 @@ function TeamAllocationView({
       current.map((allocation) => {
         if (allocation.id !== allocationId) return allocation;
         const memberId = patch.memberId ?? allocation.memberId;
-        const placement = normalizePlacement(
+        const placement = findAvailablePlacement(
+          memberId,
           patch.startSlot ?? allocation.startSlot,
           patch.hours ?? allocation.hours,
-        );
-        if (hasCollision(
-          memberId,
-          placement.startSlot,
-          placement.hours,
           allocationId,
-        )) {
+        );
+        if (!placement) {
           setToast("A alteração sobrepõe outra alocação.");
           return allocation;
         }
@@ -5853,16 +5899,22 @@ function TeamAllocationView({
       const byStart = new Map(
         memberAllocations
           .sort((left, right) => left.startSlot - right.startSlot)
-          .map((allocation) => [allocation.startSlot, allocation]),
+          .flatMap((allocation) =>
+            segmentsFor(allocation).map((segment) => [
+              segment.startSlot,
+              { allocation, segment },
+            ] as const),
+          ),
       );
       const cells: string[] = [];
       for (let slot = 0; slot < 40;) {
-        const allocation = byStart.get(slot);
-        if (!allocation) {
+        const entry = byStart.get(slot);
+        if (!entry) {
           cells.push(`<td style="height:62px;padding:0;border-right:1px solid #eef0f3;border-bottom:1px solid ${border};background:#fff"></td>`);
           slot += 1;
           continue;
         }
+        const { allocation, segment } = entry;
         const issue = allocation.issueId ? issueById.get(allocation.issueId) : null;
         const project = issue?.project ?? allocation.customTitle ?? "Outro";
         const issueLine = allocation.timelineTaskId
@@ -5876,8 +5928,8 @@ function TeamAllocationView({
           : `<br><span style="color:#747b87;font-size:9px;font-style:italic">${TEAM_ABSENCE_TYPES[allocation.absenceType ?? "other"].label} · sem cliente/US</span>`;
         const color = issue?.color ?? allocation.customColor ?? "#8b91a7";
         const background = allocation.timelineTaskId ? "#eaf2ff" : issue ? `${color}20` : allocation.absenceType === "vacation" ? "#fff0d5" : allocation.absenceType === "absence" ? "#fbe1e4" : allocation.absenceType === "training" ? "#ddf3ed" : "#eceef2";
-        cells.push(`<td colspan="${allocation.hours}" style="height:50px;padding:6px 8px;vertical-align:middle;color:#3e4655;border-right:1px solid ${border};border-bottom:1px solid ${border};border-left:4px ${issue && !allocation.timelineTaskId ? "solid" : "dashed"} ${color};background:${background};font-family:Arial,sans-serif"><strong style="display:block;font-size:11px">${escapeHtml(project)}</strong>${issueLine}<span style="float:right;color:#6a65dd;font-size:9px">${formatHours(allocationHours(allocation))}</span></td>`);
-        slot += allocation.hours;
+        cells.push(`<td colspan="${segment.hours}" style="height:50px;padding:6px 8px;vertical-align:middle;color:#3e4655;border-right:1px solid ${border};border-bottom:1px solid ${border};border-left:4px ${issue && !allocation.timelineTaskId ? "solid" : "dashed"} ${color};background:${background};font-family:Arial,sans-serif"><strong style="display:block;font-size:11px">${escapeHtml(project)}</strong>${issueLine}<span style="float:right;color:#6a65dd;font-size:9px">${formatHours(segment.hours)}${segment.hours !== allocation.hours ? ` / ${formatHours(allocationHours(allocation))}` : ""}</span></td>`);
+        slot += segment.hours;
       }
       return `<tr><th style="height:62px;padding:8px 10px;text-align:left;vertical-align:middle;white-space:nowrap;color:#343c4b;border-right:1px solid ${border};border-bottom:1px solid ${border};background:#fff;font-size:11px">${escapeHtml(member.name)}${member.role ? `<br><span style="color:#9198a5;font-size:9px;font-weight:400">${escapeHtml(member.role)}</span>` : ""}<br><span style="color:#6560dc;font-size:9px;font-weight:400">${formatHours(total)} · ${Math.round((total / 40) * 100)}%</span></th>${cells.join("")}</tr>`;
     }).join("");
@@ -5891,7 +5943,9 @@ function TeamAllocationView({
       displayedAllocations
         .filter((allocation) => allocation.memberId === member.id)
         .forEach((allocation) => {
-          slots[allocation.startSlot] = allocationText(allocation);
+          segmentsFor(allocation).forEach((segment) => {
+            slots[segment.startSlot] = allocationText(allocation);
+          });
         });
       return [member.name, ...slots].join("\t");
     });
@@ -5927,13 +5981,9 @@ function TeamAllocationView({
         .filter((allocation) => allocation.memberId === member.id)
         .forEach((allocation) => {
           const text = allocationText(allocation);
-          for (
-            let slot = allocation.startSlot;
-            slot < allocation.startSlot + allocation.hours;
-            slot++
-          ) {
-            slots[slot] = text;
-          }
+          segmentsFor(allocation).forEach((segment) => {
+            for (let slot = segment.startSlot; slot < segment.startSlot + segment.hours; slot++) slots[slot] = text;
+          });
         });
       return [member.name, ...slots];
     });
@@ -5974,9 +6024,9 @@ function TeamAllocationView({
         .filter((allocation) => allocation.memberId === member.id)
         .forEach((allocation) => {
           const text = allocationText(allocation);
-          for (let slot = allocation.startSlot; slot < allocation.startSlot + allocation.hours; slot++) {
-            slots[slot] = text;
-          }
+          segmentsFor(allocation).forEach((segment) => {
+            for (let slot = segment.startSlot; slot < segment.startSlot + segment.hours; slot++) slots[slot] = text;
+          });
         });
       return [member.name, ...slots];
     });
@@ -6094,14 +6144,15 @@ function TeamAllocationView({
                 <div className="team-hours-grid team-member-row" key={member.id}>
                   <div className="team-member-cell"><div><strong>{member.name}</strong>{member.role && <small>{member.role}</small>}<span>{formatHours(total)} · {Math.round((total / 40) * 100)}%</span></div><button aria-label={`Remover ${member.name}`} onClick={() => removeMember(member)}>×</button></div>
                   {Array.from({ length: 40 }, (_, slot) => {
-                    const isPreview = dropPreview?.memberId === member.id && slot >= dropPreview.startSlot && slot < dropPreview.startSlot + dropPreview.hours;
+                    const isPreview = dropPreview?.memberId === member.id && dropPreview.segments.some((segment) => slot >= segment.startSlot && slot < segment.startSlot + segment.hours);
                     return <button key={slot} style={{ gridColumn: slot + 2 }} className={`team-drop-cell ${(slot + 1) % 8 === 0 ? "day-end" : ""} ${isPreview ? dropPreview.valid ? "drop-preview" : "drop-preview-invalid" : ""} ${isPreview && slot === dropPreview.startSlot ? "drop-preview-start" : ""}`} aria-label={`${member.name}, ${TEAM_WEEKDAYS[Math.floor(slot / 8)]}, hora ${(slot % 8) + 1}`} onDragEnter={(event) => { event.preventDefault(); previewDrop(member.id, slot); }} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = draggedAllocationId ? "move" : "copy"; previewDrop(member.id, slot); }} onDrop={(event) => { event.preventDefault(); setDropPreview(null); const allocationId = event.dataTransfer.getData("application/x-work-organizer-allocation") || draggedAllocationId; if (allocationId) { moveAllocation(allocationId, member.id, slot); return; } const issueId = event.dataTransfer.getData("application/x-work-organizer-issue") || draggedIssueId; if (issueId) addAllocation(member.id, slot, issueId); }} />;
                   })}
                   {[7, 15, 23, 31].map((slot) => <div key={`divider-${slot}`} className="team-member-day-divider" style={{ gridColumn: slot + 2 }} />)}
                   {memberAllocations.map((allocation) => {
                     const issue = allocation.issueId ? issueById.get(allocation.issueId) : null;
                     const fromTimeline = Boolean(allocation.timelineTaskId);
-                    return <div key={allocation.id} role="button" tabIndex={0} draggable={!fromTimeline} className={`team-allocation-block ${fromTimeline ? "timeline-derived" : ""} ${draggedAllocationId === allocation.id ? "dragging" : ""} ${!issue && !fromTimeline ? `absence absence-${allocation.absenceType ?? "other"}` : ""} ${selectedAllocationId === allocation.id ? "selected" : ""}`} style={{ gridColumn: `${allocation.startSlot + 2} / span ${allocation.hours}`, borderColor: issue?.color ?? allocation.customColor ?? "#8b91a7", background: `${issue?.color ?? allocation.customColor ?? "#8b91a7"}20` }} onDragStart={(event) => { if (fromTimeline) { event.preventDefault(); return; } event.dataTransfer.setData("application/x-work-organizer-allocation", allocation.id); event.dataTransfer.effectAllowed = "move"; setDraggedAllocationId(allocation.id); }} onDragEnd={() => { setDraggedAllocationId(null); setDropPreview(null); }} onClick={() => fromTimeline ? setToast("Este bloco vem da Timeline. Altera-o no menu Timeline.") : setSelectedAllocationId(allocation.id)} onKeyDown={(event) => { if ((event.key === "Enter" || event.key === " ") && fromTimeline) setToast("Este bloco vem da Timeline. Altera-o no menu Timeline."); else if (event.key === "Enter" || event.key === " ") setSelectedAllocationId(allocation.id); if (!fromTimeline && (event.key === "Delete" || event.key === "Backspace")) removeAllocation(allocation.id); }} title={`${allocationText(allocation)} · ${formatHours(allocationHours(allocation))}${fromTimeline ? " · preenchido pela Timeline" : " · arrasta para mover"}`}>{!fromTimeline && <button type="button" className="team-allocation-remove" aria-label={`Remover ${allocationText(allocation)}`} title="Remover da alocação" onClick={(event) => { event.stopPropagation(); removeAllocation(allocation.id); }}>×</button>}<strong>{issue?.project ?? allocation.customTitle}</strong>{fromTimeline ? allocation.timelineWebUrl ? <a href={allocation.timelineWebUrl} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>{allocation.timelineTitle}</a> : <span>{allocation.timelineTitle}</span> : issue && (issue.webUrl ? <a href={issue.webUrl} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>#{issue.iid} {issue.title}</a> : <span>#{issue.iid} {issue.title}</span>)}{!issue && !fromTimeline && <span>{TEAM_ABSENCE_TYPES[allocation.absenceType ?? "other"].label} · sem cliente/US</span>}<small>{formatHours(allocationHours(allocation))}</small></div>;
+                    const segments = segmentsFor(allocation);
+                    return segments.map((segment, segmentIndex) => <div key={`${allocation.id}-${segmentIndex}`} role="button" tabIndex={segmentIndex === 0 ? 0 : -1} draggable={!fromTimeline} className={`team-allocation-block ${segments.length > 1 ? "split-allocation" : ""} ${fromTimeline ? "timeline-derived" : ""} ${draggedAllocationId === allocation.id ? "dragging" : ""} ${!issue && !fromTimeline ? `absence absence-${allocation.absenceType ?? "other"}` : ""} ${selectedAllocationId === allocation.id ? "selected" : ""}`} style={{ gridColumn: `${segment.startSlot + 2} / span ${segment.hours}`, borderColor: issue?.color ?? allocation.customColor ?? "#8b91a7", background: `${issue?.color ?? allocation.customColor ?? "#8b91a7"}20` }} onDragStart={(event) => { if (fromTimeline) { event.preventDefault(); return; } event.dataTransfer.setData("application/x-work-organizer-allocation", allocation.id); event.dataTransfer.effectAllowed = "move"; setDraggedAllocationId(allocation.id); }} onDragEnd={() => { setDraggedAllocationId(null); setDropPreview(null); }} onClick={() => fromTimeline ? setToast("Este bloco vem da Timeline. Altera-o no menu Timeline.") : setSelectedAllocationId(allocation.id)} onKeyDown={(event) => { if ((event.key === "Enter" || event.key === " ") && fromTimeline) setToast("Este bloco vem da Timeline. Altera-o no menu Timeline."); else if (event.key === "Enter" || event.key === " ") setSelectedAllocationId(allocation.id); if (!fromTimeline && (event.key === "Delete" || event.key === "Backspace")) removeAllocation(allocation.id); }} title={`${allocationText(allocation)} · segmento ${formatHours(segment.hours)} de ${formatHours(allocationHours(allocation))}${fromTimeline ? " · preenchido pela Timeline" : " · arrasta para mover"}`}>{!fromTimeline && <button type="button" className="team-allocation-remove" aria-label={`Remover ${allocationText(allocation)}`} title="Remover toda a alocação" onClick={(event) => { event.stopPropagation(); removeAllocation(allocation.id); }}>×</button>}<strong>{issue?.project ?? allocation.customTitle}</strong>{fromTimeline ? allocation.timelineWebUrl ? <a href={allocation.timelineWebUrl} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>{allocation.timelineTitle}</a> : <span>{allocation.timelineTitle}</span> : issue && (issue.webUrl ? <a href={issue.webUrl} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>#{issue.iid} {issue.title}</a> : <span>#{issue.iid} {issue.title}</span>)}{!issue && !fromTimeline && <span>{TEAM_ABSENCE_TYPES[allocation.absenceType ?? "other"].label} · sem cliente/US</span>}<small>{formatHours(segment.hours)}{segments.length > 1 && ` / ${formatHours(allocationHours(allocation))}`}</small></div>);
                   })}
                 </div>
               );
