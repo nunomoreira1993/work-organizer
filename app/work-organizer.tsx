@@ -5402,6 +5402,7 @@ function TeamAllocationView({
   >("all");
   const [draftHours, setDraftHours] = useState<Record<string, number>>({});
   const [draggedIssueId, setDraggedIssueId] = useState<string | null>(null);
+  const [draggedAllocationId, setDraggedAllocationId] = useState<string | null>(null);
   const [selectedAllocationId, setSelectedAllocationId] = useState<string | null>(null);
   const [newMemberName, setNewMemberName] = useState("");
   const [customTitle, setCustomTitle] = useState("");
@@ -5582,6 +5583,30 @@ function TeamAllocationView({
     );
   }
 
+  function moveAllocation(allocationId: string, memberId: string, startSlot: number) {
+    const allocation = allocations.find((item) => item.id === allocationId);
+    if (!allocation) return;
+    const hours = Math.min(allocation.hours, 40 - startSlot);
+    if (hasCollision(memberId, startSlot, hours, allocationId)) {
+      setToast("Esse período já tem uma alocação. Larga o bloco noutra célula.");
+      return;
+    }
+    setAllocations((current) =>
+      current.map((item) =>
+        item.id === allocationId
+          ? { ...item, memberId, startSlot, hours }
+          : item,
+      ),
+    );
+    setSelectedAllocationId(allocationId);
+  }
+
+  function removeAllocation(allocationId: string) {
+    setAllocations((current) => current.filter((item) => item.id !== allocationId));
+    setSelectedAllocationId((current) => current === allocationId ? null : current);
+    setToast("Alocação removida.");
+  }
+
   function addMember() {
     const name = newMemberName.trim();
     if (!name) return;
@@ -5609,13 +5634,19 @@ function TeamAllocationView({
   }
 
   function buildEmailTable() {
-    const percentRow = Array.from({ length: 40 }, () => "<th>2.5%</th>").join("");
-    const hourRow = Array.from({ length: 40 }, (_, index) => `<th>${(index % 8) + 1}</th>`).join("");
-    const dayRow = TEAM_WEEKDAYS.map((day) => `<th colspan="8">${day}</th>`).join("");
+    const border = "#dfe2e8";
+    const percentRow = Array.from({ length: 40 }, () => `<th style="width:30px;height:24px;padding:0;text-align:center;color:#8d94a2;border-right:1px solid #eceef2;border-bottom:1px solid ${border};font-size:9px;font-weight:400">2.5%</th>`).join("");
+    const hourRow = Array.from({ length: 40 }, (_, index) => `<th style="height:28px;padding:0;text-align:center;color:#5b6371;border-right:1px solid #eceef2;border-bottom:1px solid ${border};font-size:10px">${(index % 8) + 1}</th>`).join("");
+    const dayRow = TEAM_WEEKDAYS.map((day, index) => `<th colspan="8" style="height:38px;padding:0 9px;text-align:left;color:#4c5463;border-right:1px solid #cdd1da;border-bottom:1px solid ${border};background:#f5f6f9;font-size:11px">${day}<span style="float:right;color:#9299a7;font-size:9px;font-weight:400">${escapeHtml(formatDate(addDays(weekStart, index)))}</span></th>`).join("");
+    const corner = (content: string) => `<th style="width:210px;padding:0 12px;text-align:left;color:#4d5564;border-right:1px solid ${border};border-bottom:1px solid ${border};background:#fafbfc;font-size:10px">${content}</th>`;
+    const columns = `<colgroup><col style="width:210px">${Array.from({ length: 40 }, () => '<col style="width:30px">').join("")}</colgroup>`;
     const body = members.map((member) => {
+      const memberAllocations = currentAllocations.filter(
+        (allocation) => allocation.memberId === member.id,
+      );
+      const total = memberAllocations.reduce((sum, allocation) => sum + allocation.hours, 0);
       const byStart = new Map(
-        currentAllocations
-          .filter((allocation) => allocation.memberId === member.id)
+        memberAllocations
           .sort((left, right) => left.startSlot - right.startSlot)
           .map((allocation) => [allocation.startSlot, allocation]),
       );
@@ -5623,7 +5654,7 @@ function TeamAllocationView({
       for (let slot = 0; slot < 40;) {
         const allocation = byStart.get(slot);
         if (!allocation) {
-          cells.push("<td></td>");
+          cells.push(`<td style="height:62px;padding:0;border-right:1px solid #eef0f3;border-bottom:1px solid ${border};background:#fff"></td>`);
           slot += 1;
           continue;
         }
@@ -5631,15 +5662,17 @@ function TeamAllocationView({
         const project = issue?.project ?? allocation.customTitle ?? "Outro";
         const issueLine = issue
           ? issue.webUrl
-            ? `<br><a href="${escapeHtml(issue.webUrl)}">#${issue.iid} ${escapeHtml(issue.title)}</a>`
-            : `<br>#${issue.iid} ${escapeHtml(issue.title)}`
-          : "";
-        cells.push(`<td colspan="${allocation.hours}" style="background:${issue?.color ?? allocation.customColor ?? "#8b91a7"}22;border-left:4px solid ${issue?.color ?? allocation.customColor ?? "#8b91a7"};padding:6px"><strong>${escapeHtml(project)}</strong>${issueLine}</td>`);
+            ? `<br><a href="${escapeHtml(issue.webUrl)}" style="color:#596171;text-decoration:none;font-size:10px">#${issue.iid} ${escapeHtml(issue.title)}</a>`
+            : `<br><span style="color:#596171;font-size:10px">#${issue.iid} ${escapeHtml(issue.title)}</span>`
+          : `<br><span style="color:#747b87;font-size:9px;font-style:italic">${TEAM_ABSENCE_TYPES[allocation.absenceType ?? "other"].label} · sem cliente/US</span>`;
+        const color = issue?.color ?? allocation.customColor ?? "#8b91a7";
+        const background = issue ? `${color}20` : allocation.absenceType === "vacation" ? "#fff0d5" : allocation.absenceType === "absence" ? "#fbe1e4" : allocation.absenceType === "training" ? "#ddf3ed" : "#eceef2";
+        cells.push(`<td colspan="${allocation.hours}" style="height:50px;padding:6px 8px;vertical-align:middle;color:#3e4655;border-right:1px solid ${border};border-bottom:1px solid ${border};border-left:4px ${issue ? "solid" : "dashed"} ${color};background:${background};font-family:Arial,sans-serif"><strong style="display:block;font-size:11px">${escapeHtml(project)}</strong>${issueLine}<span style="float:right;color:#6a65dd;font-size:9px">${formatHours(allocation.hours)}</span></td>`);
         slot += allocation.hours;
       }
-      return `<tr><th style="text-align:left;white-space:nowrap">${escapeHtml(member.name)}${member.role ? ` (${escapeHtml(member.role)})` : ""}</th>${cells.join("")}</tr>`;
+      return `<tr><th style="height:62px;padding:8px 10px;text-align:left;vertical-align:middle;white-space:nowrap;color:#343c4b;border-right:1px solid ${border};border-bottom:1px solid ${border};background:#fff;font-size:11px">${escapeHtml(member.name)}${member.role ? `<br><span style="color:#9198a5;font-size:9px;font-weight:400">${escapeHtml(member.role)}</span>` : ""}<br><span style="color:#6560dc;font-size:9px;font-weight:400">${formatHours(total)} · ${Math.round((total / 40) * 100)}%</span></th>${cells.join("")}</tr>`;
     }).join("");
-    return `<table style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:12px" border="1" cellpadding="4"><thead><tr><th></th>${percentRow}</tr><tr><th></th>${hourRow}</tr><tr><th>${escapeHtml(teamWeekLabel(weekStart))}</th>${dayRow}</tr></thead><tbody>${body}</tbody></table>`;
+    return `<div style="font-family:Arial,sans-serif;color:#343c4b"><div style="margin:0 0 10px"><strong style="font-size:18px">Alocação semanal da equipa</strong><br><span style="color:#7c8492;font-size:11px">${escapeHtml(teamWeekLabel(weekStart))} · 1 célula = 1 h = 2,5%</span></div><table role="presentation" cellspacing="0" cellpadding="0" style="width:1410px;table-layout:fixed;border-collapse:collapse;border:1px solid ${border};font-family:Arial,sans-serif;background:#fff">${columns}<thead><tr>${corner("Pessoa")}${percentRow}</tr><tr>${corner("Semana")}${dayRow}</tr><tr>${corner("Hora")}${hourRow}</tr></thead><tbody>${body}</tbody></table></div>`;
   }
 
   async function copyForEmail() {
@@ -5782,7 +5815,7 @@ function TeamAllocationView({
               <label><span>Dia</span><select value={Math.floor(selectedAllocation.startSlot / 8)} onChange={(event) => updateAllocation(selectedAllocation.id, { startSlot: Number(event.target.value) * 8 + (selectedAllocation.startSlot % 8) })}>{TEAM_WEEKDAYS.map((day, index) => <option key={day} value={index}>{day}</option>)}</select></label>
               <label><span>Hora</span><select value={selectedAllocation.startSlot % 8} onChange={(event) => updateAllocation(selectedAllocation.id, { startSlot: Math.floor(selectedAllocation.startSlot / 8) * 8 + Number(event.target.value) })}>{Array.from({ length: 8 }, (_, index) => <option key={index} value={index}>{index + 1}</option>)}</select></label>
               <label><span>Horas</span><input type="number" min="1" max={40 - selectedAllocation.startSlot} value={selectedAllocation.hours} onChange={(event) => updateAllocation(selectedAllocation.id, { hours: Number(event.target.value) || 1 })} /></label>
-              <button className="danger-button" onClick={() => { setAllocations((current) => current.filter((item) => item.id !== selectedAllocation.id)); setSelectedAllocationId(null); }}>Remover</button>
+              <button className="danger-button" onClick={() => removeAllocation(selectedAllocation.id)}>Remover</button>
               <button className="icon-button" aria-label="Fechar editor" onClick={() => setSelectedAllocationId(null)}>×</button>
             </div>
           )}
@@ -5802,10 +5835,10 @@ function TeamAllocationView({
               return (
                 <div className="team-hours-grid team-member-row" key={member.id}>
                   <div className="team-member-cell"><div><strong>{member.name}</strong>{member.role && <small>{member.role}</small>}<span>{formatHours(total)} · {Math.round((total / 40) * 100)}%</span></div><button aria-label={`Remover ${member.name}`} onClick={() => removeMember(member)}>×</button></div>
-                  {Array.from({ length: 40 }, (_, slot) => <button key={slot} className={`team-drop-cell ${(slot + 1) % 8 === 0 ? "day-end" : ""}`} aria-label={`${member.name}, ${TEAM_WEEKDAYS[Math.floor(slot / 8)]}, hora ${(slot % 8) + 1}`} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "copy"; }} onDrop={(event) => { event.preventDefault(); const issueId = event.dataTransfer.getData("application/x-work-organizer-issue") || draggedIssueId; if (issueId) addAllocation(member.id, slot, issueId); }} />)}
+                  {Array.from({ length: 40 }, (_, slot) => <button key={slot} className={`team-drop-cell ${(slot + 1) % 8 === 0 ? "day-end" : ""}`} aria-label={`${member.name}, ${TEAM_WEEKDAYS[Math.floor(slot / 8)]}, hora ${(slot % 8) + 1}`} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = draggedAllocationId ? "move" : "copy"; }} onDrop={(event) => { event.preventDefault(); const allocationId = event.dataTransfer.getData("application/x-work-organizer-allocation") || draggedAllocationId; if (allocationId) { moveAllocation(allocationId, member.id, slot); return; } const issueId = event.dataTransfer.getData("application/x-work-organizer-issue") || draggedIssueId; if (issueId) addAllocation(member.id, slot, issueId); }} />)}
                   {memberAllocations.map((allocation) => {
                     const issue = allocation.issueId ? issueById.get(allocation.issueId) : null;
-                    return <div key={allocation.id} role="button" tabIndex={0} className={`team-allocation-block ${!issue ? `absence absence-${allocation.absenceType ?? "other"}` : ""} ${selectedAllocationId === allocation.id ? "selected" : ""}`} style={{ gridColumn: `${allocation.startSlot + 2} / span ${allocation.hours}`, borderColor: issue?.color ?? allocation.customColor ?? "#8b91a7", background: `${issue?.color ?? allocation.customColor ?? "#8b91a7"}20` }} onClick={() => setSelectedAllocationId(allocation.id)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") setSelectedAllocationId(allocation.id); }} title={`${allocationText(allocation)} · ${formatHours(allocation.hours)}`}><strong>{issue?.project ?? allocation.customTitle}</strong>{issue && (issue.webUrl ? <a href={issue.webUrl} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>#{issue.iid} {issue.title}</a> : <span>#{issue.iid} {issue.title}</span>)}{!issue && <span>{TEAM_ABSENCE_TYPES[allocation.absenceType ?? "other"].label} · sem cliente/US</span>}<small>{formatHours(allocation.hours)}</small></div>;
+                    return <div key={allocation.id} role="button" tabIndex={0} draggable className={`team-allocation-block ${draggedAllocationId === allocation.id ? "dragging" : ""} ${!issue ? `absence absence-${allocation.absenceType ?? "other"}` : ""} ${selectedAllocationId === allocation.id ? "selected" : ""}`} style={{ gridColumn: `${allocation.startSlot + 2} / span ${allocation.hours}`, borderColor: issue?.color ?? allocation.customColor ?? "#8b91a7", background: `${issue?.color ?? allocation.customColor ?? "#8b91a7"}20` }} onDragStart={(event) => { event.dataTransfer.setData("application/x-work-organizer-allocation", allocation.id); event.dataTransfer.effectAllowed = "move"; setDraggedAllocationId(allocation.id); }} onDragEnd={() => setDraggedAllocationId(null)} onClick={() => setSelectedAllocationId(allocation.id)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") setSelectedAllocationId(allocation.id); if (event.key === "Delete" || event.key === "Backspace") removeAllocation(allocation.id); }} title={`${allocationText(allocation)} · ${formatHours(allocation.hours)} · arrasta para mover`}><button type="button" className="team-allocation-remove" aria-label={`Remover ${allocationText(allocation)}`} title="Remover da alocação" onClick={(event) => { event.stopPropagation(); removeAllocation(allocation.id); }}>×</button><strong>{issue?.project ?? allocation.customTitle}</strong>{issue && (issue.webUrl ? <a href={issue.webUrl} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>#{issue.iid} {issue.title}</a> : <span>#{issue.iid} {issue.title}</span>)}{!issue && <span>{TEAM_ABSENCE_TYPES[allocation.absenceType ?? "other"].label} · sem cliente/US</span>}<small>{formatHours(allocation.hours)}</small></div>;
                   })}
                 </div>
               );
