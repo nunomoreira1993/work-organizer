@@ -4254,6 +4254,7 @@ button:disabled {
   font: inherit;
 }
 .team-issue-filters .multi-filter summary { height: 34px; font-size: 8px; }
+.team-issue-filters select { font-size: 8px; }
 .team-issue-list { position: relative; z-index: 1; min-height: 180px; overflow-y: auto; }
 .team-issue-card {
   position: relative;
@@ -4280,6 +4281,7 @@ button:disabled {
 .team-issue-card > div { min-width: 0; }
 .team-issue-card > div > small { display: block; margin-bottom: 4px; color: #9299a7; font-size: 7px; }
 .team-issue-card > div > strong { display: -webkit-box; overflow: hidden; color: #3e4655; font-size: 9px; line-height: 1.35; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.team-issue-card .issue-assignees.compact { margin-top: 5px; }
 .team-issue-card > label { display: flex; flex-direction: column; gap: 4px; color: #858d9b; font-size: 7px; }
 .team-issue-card > label input { width: 55px; height: 30px; padding: 0 7px; border: 1px solid #dfe1e7; border-radius: 7px; }
 .team-allocated-note { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; gap: 8px; color: #8b92a0; font-size: 7px; }

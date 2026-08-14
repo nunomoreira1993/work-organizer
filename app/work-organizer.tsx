@@ -6040,7 +6040,7 @@ function TeamAllocationView({
                   onDragEnd={() => { setDraggedIssueId(null); setDropPreview(null); }}
                 >
                   <span className="team-issue-color" style={{ background: issue.color }} />
-                  <div><small>{issue.client} · {issue.project} · #{issue.iid}</small><strong>{issue.title}</strong><IssueLabels labels={issue.labels} /></div>
+                  <div><small>{issue.client} · {issue.project} · #{issue.iid}</small><strong>{issue.title}</strong><IssueLabels labels={issue.labels} /><IssueAssignees assignees={issue.assignees} compact /></div>
                   <label onClick={(event) => event.stopPropagation()}><span>Horas</span><input type="number" min="1" max="40" step="1" value={hours} onChange={(event) => setDraftHours((current) => ({ ...current, [issue.id]: Math.min(40, Math.max(1, Number(event.target.value) || 1)) }))} /></label>
                   <small className="team-allocated-note"><b>{allocationState === "fully-allocated" ? "✓ Totalmente alocada" : allocationState === "partially-allocated" ? "◐ Parcialmente alocada" : "○ Ainda não alocada"}</b><span>{formatHours(allocated)} nesta semana{issue.estimateTotal > 0 ? ` / ${formatHours(issue.estimateTotal)}` : ""}</span></small>
                 </article>
