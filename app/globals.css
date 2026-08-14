@@ -4361,8 +4361,8 @@ button:disabled {
 }
 .team-percent-cell { grid-row: 1; }
 .team-hour-cell { grid-row: 3; color: #5b6371; font-size: 7px; font-weight: 700; }
-.team-percent-cell:nth-of-type(8n + 41),
-.team-hour-cell:nth-of-type(8n + 41) { border-right-color: #cdd1da; }
+.team-percent-cell.day-end,
+.team-hour-cell.day-end { border-right-color: #c8cdd7; }
 .team-day-cell {
   padding: 0 9px;
   display: flex;
@@ -4427,7 +4427,12 @@ button:disabled {
 }
 .team-allocation-block:active { cursor: grabbing; }
 .team-allocation-block.dragging { opacity: 0.4; }
-.team-allocation-block.segmented { border-style: dashed; }
+.team-member-day-divider {
+  z-index: 6;
+  grid-row: 1;
+  border-right: 1px solid #c8cdd7;
+  pointer-events: none;
+}
 .team-allocation-block:hover,
 .team-allocation-block.selected { box-shadow: 0 0 0 2px rgba(95, 91, 246, 0.3), 0 4px 12px rgba(42, 50, 71, 0.12); }
 .team-allocation-block strong,
