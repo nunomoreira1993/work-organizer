@@ -5308,6 +5308,61 @@ function IssuesView({ issues, tasks }: { issues: IssueRecord[]; tasks: Task[] })
     setAllocation("all");
   }
 
+  function exportFilteredIssues() {
+    const protectExcelFormula = (value: string) =>
+      /^[=+\-@]/.test(value.trimStart()) ? `'${value}` : value;
+    const csvCell = (value: string | number) => {
+      const text = typeof value === "number"
+        ? String(value).replace(".", ",")
+        : protectExcelFormula(value);
+      return `"${text.replaceAll('"', '""')}"`;
+    };
+    const header = [
+      "Cliente",
+      "Projeto",
+      "US",
+      "Título da US",
+      "Estimativa (h)",
+      "Labels",
+      "Responsáveis",
+      "Estado",
+      "Alocado (h)",
+      "Por alocar (h)",
+      "Link GitLab",
+    ];
+    const rows = filtered.map((issue) => {
+      const planned = plannedByIssue.get(issue.id) ?? 0;
+      return [
+        issue.client,
+        issue.project,
+        `#${issue.iid}`,
+        issue.title,
+        issue.estimateTotal,
+        issue.labels.map((label) => label.name).join(", "),
+        issue.assignees
+          .map((assignee) => assignee.name || assignee.username || `Utilizador ${assignee.id}`)
+          .join(", ") || "Sem responsável",
+        issue.state === "opened" ? "Open" : "Closed",
+        planned,
+        Math.max(0, issue.estimateTotal - planned),
+        issue.webUrl ?? "",
+      ];
+    });
+    const csv = [header, ...rows]
+      .map((row) => row.map(csvCell).join(";"))
+      .join("\r\n");
+    const selectedLabelPart = selectedLabels.length === 1
+      ? `-${selectedLabels[0].toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "")}`
+      : "";
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(
+      new Blob([`\uFEFF${csv}`], { type: "text/csv;charset=utf-8" }),
+    );
+    link.download = `us-export${selectedLabelPart}-${dateKey(new Date())}.csv`;
+    link.click();
+    URL.revokeObjectURL(link.href);
+  }
+
   return (
     <div className="page wide-page issues-view">
       <PageIntro
@@ -5315,9 +5370,10 @@ function IssuesView({ issues, tasks }: { issues: IssueRecord[]; tasks: Task[] })
         title="Explorar US"
         description="Combina filtros para localizar trabalho e perceber rapidamente quantas horas ainda precisam de alocação."
       >
-        <button className="secondary-button" onClick={clearFilters}>
-          Limpar filtros
-        </button>
+        <div className="issue-export-actions">
+          <button className="secondary-button" onClick={clearFilters}>Limpar filtros</button>
+          <button className="primary-button" onClick={exportFilteredIssues} disabled={!filtered.length}>Exportar para Excel ({filtered.length})</button>
+        </div>
       </PageIntro>
       <section className="metrics-grid issue-metrics">
         <article><small>US ENCONTRADAS</small><strong>{filtered.length}</strong><p>de {issues.length} sincronizadas</p></article>

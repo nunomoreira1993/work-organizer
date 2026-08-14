@@ -3547,6 +3547,9 @@ button:disabled {
   min-height: 108px;
 }
 
+.issue-export-actions { display: flex; align-items: center; gap: 8px; }
+.issue-export-actions button:disabled { opacity: 0.45; cursor: not-allowed; }
+
 .issue-explorer {
   overflow: visible;
 }
